@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChallengeAcceptEvent,
   ChallengeCancelledEvent,
@@ -9,23 +9,33 @@ import {
   ChallengeSendEvent,
   ChallengeWithdrawEvent,
   DistrictPlayersEvent,
+  GAME_TYPE_PRECISION_CLASH,
   LOBBY_HEIGHT,
   LOBBY_WIDTH,
   PlayerJoinDistrictEvent,
   PlayerMoveEvent,
   PlayerMovedEvent,
+  isGameType,
   type ChallengeCancelledReason,
   type ChallengeFailedReason,
+  type ChallengeReceivedPayload,
   type DistrictPlayersPayload,
+  type GameType,
   type LobbyPlayer,
+  type MatchMode,
   type PlayerJoinDistrictPayload,
   type PlayerMovedPayload,
   type PlayerProfile,
 } from '@kerala-battle/shared';
 import { avatarColor } from '../lib/visual';
+import { usePreviousChampion } from '../lib/competition';
 import type { DistrictSocket } from '../App';
 import PlayerCard from './PlayerCard';
+import VirtualJoystick from './VirtualJoystick';
 import { IncomingChallengeModal, OutgoingChallengeModal, Toast } from './ChallengeUI';
+import VoiceProvider from '../voice/VoiceProvider';
+import { useVoice, type VoiceController } from '../voice/voiceContext';
+import VoiceControls from '../voice/VoiceControls';
 
 const MOVE_SPEED = 260; // world units per second
 const SEND_INTERVAL_MS = 66; // ~15 movement updates per second while moving
@@ -46,6 +56,9 @@ interface LobbyArenaProps {
   /** True while the local player is inside a match overlay. */
   matchActive: boolean;
   isDev: boolean;
+  serverUrl: string;
+  /** Lets App force-leave voice on match start / district change. */
+  voiceControllerRef: { current: VoiceController | null };
 }
 
 const KEY_DIRECTIONS: Record<string, 'up' | 'down' | 'left' | 'right'> = {
@@ -71,21 +84,79 @@ function joinDistrictPayload(profile: PlayerProfile): PlayerJoinDistrictPayload 
   };
 }
 
-export default function LobbyArena({ socket, profile, connected, matchActive, isDev }: LobbyArenaProps) {
+/**
+ * Subtle voice indicator rendered under each avatar. Shows the local mic
+ * state for the local player, and speaking/muted state for remote players
+ * who are in the district voice room.
+ */
+function VoiceAvatarBadge({ playerId, isLocal }: { playerId: string; isLocal: boolean }) {
+  const voice = useVoice();
+  if (voice.status !== 'connected') return null;
+  if (isLocal) {
+    return (
+      <span className="voice-badge" title={voice.micMuted ? 'Microphone muted' : 'Microphone on'}>
+        {voice.micMuted ? '🔇' : '🎙️'}
+      </span>
+    );
+  }
+  if (!voice.voiceParticipantIds.has(playerId)) return null;
+  if (voice.locallyMutedIds.has(playerId)) {
+    return (
+      <span className="voice-badge" title="Muted by you (only you)">
+        🔇
+      </span>
+    );
+  }
+  if (voice.speakingIds.has(playerId)) {
+    return (
+      <span className="voice-badge voice-speaking" title="Speaking">
+        🎙️✨
+      </span>
+    );
+  }
+  if (voice.remoteMicMutedIds.has(playerId)) {
+    return (
+      <span className="voice-badge" title="Microphone muted">
+        🔇
+      </span>
+    );
+  }
+  return (
+    <span className="voice-badge" title="In voice chat">
+      🎙️
+    </span>
+  );
+}
+
+export default function LobbyArena({
+  socket,
+  profile,
+  connected,
+  matchActive,
+  isDev,
+  serverUrl,
+  voiceControllerRef,
+}: LobbyArenaProps) {
   const [roster, setRoster] = useState<LobbyPlayer[]>([]);
   const [fps, setFps] = useState(0);
   const [selected, setSelected] = useState<LobbyPlayer | null>(null);
-  const [outgoing, setOutgoing] = useState<{ targetPlayerId: string; targetName: string } | null>(
-    null,
-  );
-  const [incoming, setIncoming] = useState<{ challengeId: string; challengerName: string } | null>(
-    null,
-  );
+  const [outgoing, setOutgoing] = useState<{
+    targetPlayerId: string;
+    targetName: string;
+    gameType: GameType;
+  } | null>(null);
+  const [incoming, setIncoming] = useState<{
+    challengeId: string;
+    challengerName: string;
+    gameType: GameType;
+    matchMode: MatchMode;
+  } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
   const positionsRef = useRef(new Map<string, TrackedPlayer>());
   const nodesRef = useRef(new Map<string, HTMLDivElement>());
   const keysRef = useRef(new Set<'up' | 'down' | 'left' | 'right'>());
+  // Virtual joystick vector (shared component writes into this ref).
   const joyRef = useRef({ x: 0, y: 0 });
   const dirtyRef = useRef(false);
   const lastSentRef = useRef(0);
@@ -101,6 +172,24 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
   socketRef.current = socket;
   const matchActiveRef = useRef(matchActive);
   matchActiveRef.current = matchActive;
+
+  // Last week's Weekly Master, server-authoritative: their avatar wears the
+  // crown for the whole following week.
+  const previousChampion = usePreviousChampion(serverUrl, socket);
+  const masterPlayerId = previousChampion?.weeklyMaster?.playerId ?? null;
+  // Voice proximity reads the existing server-authoritative lobby positions:
+  // no second location system. Pulled by the voice provider ~8x/sec.
+  const getVoicePositions = useCallback(() => {    const localId = profileRef.current.playerId;
+    const local = positionsRef.current.get(localId);
+    const remotes = new Map<string, { x: number; y: number }>();
+    for (const [id, tracked] of positionsRef.current) {
+      if (id !== localId) remotes.set(id, { x: tracked.x, y: tracked.y });
+    }
+    return {
+      local: local ? { x: local.x, y: local.y } : null,
+      remotes,
+    };
+  }, []);
 
   const showToast = (message: string): void => {
     setToast(message);
@@ -133,6 +222,8 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
         return 'That player is currently in a match';
       case 'already-pending':
         return 'A challenge is already pending';
+      case 'invalid-game':
+        return 'Please pick a game to play';
     }
   };
 
@@ -197,14 +288,13 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
     socket.on(DistrictPlayersEvent, handlePlayers);
     socket.on(PlayerMovedEvent, handleMoved);
 
-    const handleChallengeReceived = (payload: {
-      challengeId: string;
-      challenger: { playerId: string; displayName: string };
-    }) => {
+    const handleChallengeReceived = (payload: ChallengeReceivedPayload) => {
       setSelected(null);
       setIncoming({
         challengeId: payload.challengeId,
         challengerName: payload.challenger.displayName,
+        gameType: isGameType(payload.gameType) ? payload.gameType : GAME_TYPE_PRECISION_CLASH,
+        matchMode: payload.matchMode,
       });
     };
     const handleChallengeCancelled = (payload: {
@@ -367,58 +457,17 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
     return () => cancelAnimationFrame(raf);
   }, [isDev]);
 
-  // Virtual joystick (pointer events cover touch + mouse).
-  const joyBaseRef = useRef<HTMLDivElement>(null);
-  const joyKnobRef = useRef<HTMLDivElement>(null);
-  const joyPointerRef = useRef<{ active: boolean; id: number }>({ active: false, id: -1 });
-
-  const updateJoystick = (event: PointerEvent<HTMLDivElement>) => {
-    const base = joyBaseRef.current;
-    if (!base) return;
-    const rect = base.getBoundingClientRect();
-    const radius = rect.width / 2;
-    let dx = (event.clientX - (rect.left + radius)) / radius;
-    let dy = (event.clientY - (rect.top + radius)) / radius;
-    const magnitude = Math.hypot(dx, dy);
-    if (magnitude > 1) {
-      dx /= magnitude;
-      dy /= magnitude;
-    }
-    joyRef.current = { x: dx, y: dy };
-    if (joyKnobRef.current) {
-      joyKnobRef.current.style.transform =
-        `translate(${dx * radius * 0.55}px, ${dy * radius * 0.55}px)`;
-    }
-  };
-
-  const handleJoyDown = (event: PointerEvent<HTMLDivElement>) => {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    joyPointerRef.current = { active: true, id: event.pointerId };
-    updateJoystick(event);
-  };
-
-  const handleJoyMove = (event: PointerEvent<HTMLDivElement>) => {
-    if (!joyPointerRef.current.active || event.pointerId !== joyPointerRef.current.id) return;
-    updateJoystick(event);
-  };
-
-  const handleJoyEnd = () => {
-    joyPointerRef.current = { active: false, id: -1 };
-    joyRef.current = { x: 0, y: 0 };
-    if (joyKnobRef.current) joyKnobRef.current.style.transform = 'translate(0px, 0px)';
-  };
-
   const handleAvatarClick = (player: LobbyPlayer): void => {
     if (player.playerId === profileRef.current.playerId || matchActiveRef.current) return;
     setSelected(player);
   };
 
-  const handleChallengePlayer = (): void => {
+  const handleChallengePlayer = (gameType: GameType): void => {
     const target = selected;
     const socket = socketRef.current;
     if (!target || !socket) return;
-    socket.emit(ChallengeSendEvent, { targetPlayerId: target.playerId });
-    setOutgoing({ targetPlayerId: target.playerId, targetName: target.displayName });
+    socket.emit(ChallengeSendEvent, { targetPlayerId: target.playerId, gameType });
+    setOutgoing({ targetPlayerId: target.playerId, targetName: target.displayName, gameType });
     setSelected(null);
   };
 
@@ -450,35 +499,49 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
   };
 
   return (
-    <div className="arena" data-testid="arena">
-      {roster.map((player) => {
-        const isLocal = player.playerId === profile.playerId;
-        const tracked = positionsRef.current.get(player.playerId);
-        const startX = tracked ? tracked.x : player.x;
-        const startY = tracked ? tracked.y : player.y;
-        return (
-          <div
-            key={player.playerId}
-            data-player-id={player.playerId}
-            data-x={Math.round(startX)}
-            data-y={Math.round(startY)}
-            className={isLocal ? 'avatar local' : 'avatar'}
-            style={{
-              left: `${(startX / LOBBY_WIDTH) * 100}%`,
-              top: `${(startY / LOBBY_HEIGHT) * 100}%`,
-            }}
-            ref={(el) => {
-              if (el) nodesRef.current.set(player.playerId, el);
-              else nodesRef.current.delete(player.playerId);
-            }}
-            onClick={() => handleAvatarClick(player)}
-          >
-            <span className="avatar-name">{player.displayName}</span>
-            <span className="avatar-dot" style={{ background: avatarColor(player.playerId) }} />
-            {player.inMatch && <span className="avatar-badge">IN MATCH</span>}
-          </div>
-        );
-      })}
+    <VoiceProvider
+      socket={socket}
+      district={profile.district}
+      serverUrl={serverUrl}
+      getPositions={getVoicePositions}
+      controllerRef={voiceControllerRef}
+    >
+      <div className="arena" data-testid="arena">
+        <VoiceControls district={profile.district} />
+        {roster.map((player) => {
+          const isLocal = player.playerId === profile.playerId;
+          const tracked = positionsRef.current.get(player.playerId);
+          const startX = tracked ? tracked.x : player.x;
+          const startY = tracked ? tracked.y : player.y;
+          return (
+            <div
+              key={player.playerId}
+              data-player-id={player.playerId}
+              data-x={Math.round(startX)}
+              data-y={Math.round(startY)}
+              className={isLocal ? 'avatar local' : 'avatar'}
+              style={{
+                left: `${(startX / LOBBY_WIDTH) * 100}%`,
+                top: `${(startY / LOBBY_HEIGHT) * 100}%`,
+              }}
+              ref={(el) => {
+                if (el) nodesRef.current.set(player.playerId, el);
+                else nodesRef.current.delete(player.playerId);
+              }}
+              onClick={() => handleAvatarClick(player)}
+            >
+              <span className="avatar-name">{player.displayName}</span>
+              <span className="avatar-dot" style={{ background: avatarColor(player.playerId) }} />
+              <VoiceAvatarBadge playerId={player.playerId} isLocal={isLocal} />
+              {masterPlayerId === player.playerId && (
+                <span className="avatar-badge master-badge" title="Last week's Weekly Master">
+                  👑 MASTER
+                </span>
+              )}
+              {player.inMatch && <span className="avatar-badge">IN MATCH</span>}
+            </div>
+          );
+        })}
 
       {!connected && <div className="reconnect-overlay">Reconnecting…</div>}
 
@@ -494,35 +557,35 @@ export default function LobbyArena({ socket, profile, connected, matchActive, is
       {incoming && (
         <IncomingChallengeModal
           challengerName={incoming.challengerName}
+          gameType={incoming.gameType}
+          matchMode={incoming.matchMode}
           onAccept={handleAcceptChallenge}
           onDecline={handleDeclineChallenge}
         />
       )}
 
       {outgoing && (
-        <OutgoingChallengeModal targetName={outgoing.targetName} onWithdraw={handleWithdrawChallenge} />
+        <OutgoingChallengeModal
+          targetName={outgoing.targetName}
+          gameType={outgoing.gameType}
+          onWithdraw={handleWithdrawChallenge}
+        />
       )}
 
       {toast && <Toast message={toast} />}
 
-      <div
-        className="joystick"
-        ref={joyBaseRef}
-        role="group"
-        aria-label="Movement joystick"
-        onPointerDown={handleJoyDown}
-        onPointerMove={handleJoyMove}
-        onPointerUp={handleJoyEnd}
-        onPointerCancel={handleJoyEnd}
-      >
-        <div className="joystick-knob" ref={joyKnobRef} />
-      </div>
+      <VirtualJoystick
+        onMove={(x, y) => {
+          joyRef.current = { x, y };
+        }}
+      />
 
       {isDev && (
         <div className="arena-debug">
           FPS {fps} · Players {roster.length}
         </div>
       )}
-    </div>
+      </div>
+    </VoiceProvider>
   );
 }
