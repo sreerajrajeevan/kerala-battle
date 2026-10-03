@@ -11,13 +11,16 @@ import {
   RoundResultEvent,
   RoundStartedEvent,
   RoundTapEvent,
+  type KeralaDistrict,
   type MatchFinishedPayload,
+  type MatchMode,
   type MatchPlayerInfo,
   type PlayerProfile,
   type RoundResultPayload,
   type RoundStartedPayload,
 } from '@kerala-battle/shared';
 import type { DistrictSocket } from '../App';
+import MatchResultPanel from './MatchResultPanel';
 
 export interface ActiveMatchInfo {
   matchId: string;
@@ -25,13 +28,18 @@ export interface ActiveMatchInfo {
   totalRounds: number;
   startsAt: number;
   clockOffset: number;
+  matchMode: MatchMode;
+  districts: [KeralaDistrict, KeralaDistrict];
+  competitionWeekId?: string;
 }
 
 interface MatchViewProps {
   socket: DistrictSocket | null;
   profile: PlayerProfile;
   match: ActiveMatchInfo;
+  serverUrl: string;
   onExit: () => void;
+  onFindNextRanked: (matchId: string) => void;
 }
 
 type Phase =
@@ -49,7 +57,14 @@ function markerPosition(elapsedMs: number, cycleMs: number): number {
   return phase < 0.5 ? phase * 2 : 2 - phase * 2;
 }
 
-export default function MatchView({ socket, profile, match, onExit }: MatchViewProps) {
+export default function MatchView({
+  socket,
+  profile,
+  match,
+  serverUrl,
+  onExit,
+  onFindNextRanked,
+}: MatchViewProps) {
   const [phase, setPhase] = useState<Phase>('intro');
   const [countdown, setCountdown] = useState(3);
   const [roundInfo, setRoundInfo] = useState<RoundStartedPayload | null>(null);
@@ -68,6 +83,10 @@ export default function MatchView({ socket, profile, match, onExit }: MatchViewP
 
   const opponent =
     match.players.find((player) => player.playerId !== profile.playerId) ?? match.players[0];
+
+  const myPlayerIndex = match.players[0].playerId === profile.playerId ? 0 : 1;
+  const myDistrict = match.districts[myPlayerIndex] ?? profile.district;
+  const opponentDistrict = match.districts[myPlayerIndex === 0 ? 1 : 0] ?? profile.district;
 
   useEffect(() => {
     if (!socket) return;
@@ -187,6 +206,10 @@ export default function MatchView({ socket, profile, match, onExit }: MatchViewP
     onExit();
   };
 
+  const handleFindNextRanked = (): void => {
+    onFindNextRanked(matchRef.current.matchId);
+  };
+
   const winnerText = (): string => {
     if (!finalResult) return '';
     if (finalResult.winnerPlayerId === null) return 'DRAW';
@@ -195,15 +218,26 @@ export default function MatchView({ socket, profile, match, onExit }: MatchViewP
       : `🏆 ${opponent.displayName.toUpperCase()} WINS`;
   };
 
+  // Server-computed ranking awards for the local player (never calculated here).
+  // (Rendered inside MatchResultPanel; ranked matches only.)
+
   return (
     <div className="match-overlay">
       {phase === 'intro' && (
         <section className="pc-intro">
           <h2>Precision Clash</h2>
+          <p className={match.matchMode === 'ranked' ? 'match-mode-badge ranked' : 'match-mode-badge casual'}>
+            {match.matchMode === 'ranked' ? 'RANKED WEEKLY BATTLE' : 'CASUAL MATCH'}
+          </p>
           <div className="pc-vs">
-            <span>{profile.displayName}</span>
+            <span>
+              <span className="pc-district-tag">{myDistrict.toUpperCase()}</span> {profile.displayName}
+            </span>
             <em>VS</em>
-            <span>{opponent.displayName}</span>
+            <span>
+              <span className="pc-district-tag">{opponentDistrict.toUpperCase()}</span>{' '}
+              {opponent.displayName}
+            </span>
           </div>
           <div className="pc-countdown">{countdown > 0 ? countdown : 'GO!'}</div>
         </section>
@@ -257,27 +291,17 @@ export default function MatchView({ socket, profile, match, onExit }: MatchViewP
       )}
 
       {phase === 'finished' && finalResult && (
-        <section className="pc-final">
-          <h3>FINAL</h3>
-          {finalResult.totals.map((entry) => (
-            <div
-              key={entry.playerId}
-              className={entry.playerId === profile.playerId ? 'pc-row me' : 'pc-row'}
-            >
-              <span>{entry.displayName}</span>
-              <span>{entry.total}</span>
-            </div>
-          ))}
-          <div className="pc-winner">{winnerText()}</div>
-          <div className="pc-actions">
-            <button type="button" className="primary-btn" onClick={handleRematch}>
-              Rematch
-            </button>
-            <button type="button" className="secondary-btn" onClick={handleReturnToLobby}>
-              Return to Lobby
-            </button>
-          </div>
-        </section>
+        <MatchResultPanel
+          gameLabel="Precision Clash"
+          finalResult={finalResult}
+          players={match.players}
+          profile={profile}
+          serverUrl={serverUrl}
+          winnerText={winnerText()}
+          onRematch={handleRematch}
+          onReturnToLobby={handleReturnToLobby}
+          onFindNextRanked={handleFindNextRanked}
+        />
       )}
 
       {phase === 'rematchWaiting' && (
