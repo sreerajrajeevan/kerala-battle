@@ -2,8 +2,11 @@ import type { CSSProperties } from 'react';
 import type { KeralaDistrict, PlayerProfile } from '@kerala-battle/shared';
 import DistrictGrid from './DistrictGrid';
 import LobbyArena from './LobbyArena';
+import { WeeklyBattleCta } from './WeeklyBattle';
 import { districtHue } from '../lib/visual';
+import { usePreviousChampion } from '../lib/competition';
 import type { DistrictSocket } from '../App';
+import type { VoiceController } from '../voice/voiceContext';
 
 interface LobbyProps {
   profile: PlayerProfile;
@@ -13,10 +16,14 @@ interface LobbyProps {
   onStartChangeDistrict: () => void;
   onCancelChangeDistrict: () => void;
   onSelectDistrict: (district: KeralaDistrict) => void;
+  onOpenCompetition: () => void;
+  onJoinWeeklyBattle: () => void;
   socket: DistrictSocket | null;
   socketId: string | null;
   isDev: boolean;
   matchActive: boolean;
+  serverUrl: string;
+  voiceControllerRef: { current: VoiceController | null };
 }
 
 export default function Lobby({
@@ -27,11 +34,19 @@ export default function Lobby({
   onStartChangeDistrict,
   onCancelChangeDistrict,
   onSelectDistrict,
+  onOpenCompetition,
+  onJoinWeeklyBattle,
   socket,
   socketId,
   isDev,
   matchActive,
+  serverUrl,
+  voiceControllerRef,
 }: LobbyProps) {
+  const previousChampion = usePreviousChampion(serverUrl, socket);
+  const isDefendingDistrict =
+    previousChampion?.districtChampion?.district === profile.district;
+
   return (
     <main className="page lobby-page">
       <header
@@ -43,6 +58,9 @@ export default function Lobby({
           <p className="hub-title">
             {profile.district} District Hub · {onlineCount} online
           </p>
+          {isDefendingDistrict && (
+            <p className="hub-defending">🏆 Defending District Champion</p>
+          )}
         </div>
         <p className="status">
           <span className={connected ? 'status-ok' : 'status-bad'}>
@@ -57,6 +75,15 @@ export default function Lobby({
         connected={connected}
         matchActive={matchActive}
         isDev={isDev}
+        serverUrl={serverUrl}
+        voiceControllerRef={voiceControllerRef}
+      />
+
+      <WeeklyBattleCta
+        serverUrl={serverUrl}
+        profile={profile}
+        socket={socket}
+        onJoin={onJoinWeeklyBattle}
       />
 
       {changingDistrict && (
@@ -73,6 +100,9 @@ export default function Lobby({
 
       <footer className="lobby-footer">
         <span className="player-line">{profile.displayName}</span>
+        <button type="button" className="secondary-btn" onClick={onOpenCompetition}>
+          🏆 Competition
+        </button>
         <button type="button" className="secondary-btn" onClick={onStartChangeDistrict}>
           Change District
         </button>
