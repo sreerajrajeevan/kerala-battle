@@ -87,6 +87,27 @@ Copy the examples and adjust as needed (development defaults work without any `.
 - `apps/server/.env.example` → `apps/server/.env`
   - `PORT` (default `3001`)
   - `WEB_URL` (default `http://localhost:5173`, used for CORS)
+  - `DB_PATH` (default `apps/server/data/kerala-battle.db`, the SQLite competition database)
+
+## Weekly competition (persistent rankings)
+
+Every legitimately completed Precision Clash match is settled server-side into a
+SQLite database (`apps/server/data/kerala-battle.db`, git-ignored):
+
+- Personal weekly points: win **12**, draw **8**, loss **5** (result + completion bonus).
+- The winner's district earns district points, capped at **50 per player per day**
+  (Asia/Kolkata). Personal points are never capped.
+- Competition weeks run Monday 00:00 IST → Sunday 23:59:59 IST; all boundaries use
+  the `Asia/Kolkata` timezone regardless of the server's local timezone.
+- District attribution is historical: points stay with the district the player
+  represented when the match finished, even if they switch districts later.
+- Settlement is idempotent (unique `matchId`); disconnect forfeits and cancelled
+  matches are never scored.
+
+APIs: `GET /api/leaderboards/players?limit=50&playerId=…`,
+`GET /api/leaderboards/districts`. After each settled match the server broadcasts
+`competition:updated` and clients refetch. The lobby's 🏆 Competition button shows
+district/player standings, your weekly stats, and a countdown to week end.
 
 ## Scripts (repo root)
 
@@ -94,4 +115,14 @@ Copy the examples and adjust as needed (development defaults work without any `.
 - `npm run build` — build shared → web → server (order matters: web/server resolve shared via its `dist`)
 - `npm run lint` — ESLint across the repo
 - `npm run typecheck` — `tsc --noEmit` in every workspace
+- `npm run test --workspace=@kerala-battle/server` — build, then run the
+  competition unit/integration tests (`node:test`, no extra framework)
 - `npm run format` — Prettier write across the repo
+
+Server-only helpers (`apps/server`):
+
+- `npm run db:reset` — **development only**: deletes the local SQLite database file.
+  Refuses to run with `NODE_ENV=production` unless `--force` is passed.
+- `npm run db:seed` — **development only**: inserts clearly-labeled fake leaderboard
+  data (`DevSeed …` players) for all 14 districts. Never runs automatically;
+  also guarded against `NODE_ENV=production`.
