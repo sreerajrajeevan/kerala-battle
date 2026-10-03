@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { Server } from 'socket.io';
+import { Server, type Socket } from 'socket.io';
 import {
   CHALLENGE_EXPIRY_MS,
   ChallengeAcceptEvent,
@@ -15,8 +15,15 @@ import {
   ChallengeSendEvent,
   ChallengeWithdrawEvent,
   ClientHelloEvent,
+  CompetitionUpdatedEvent,
+  CompetitionWeekFinalizedEvent,
+  CrownRushInputEvent,
+  CrownRushStartedEvent,
   DistrictPlayersEvent,
   DistrictPopulationEvent,
+  GAME_DEFINITIONS,
+  GAME_TYPE_CROWN_RUSH,
+  GAME_TYPE_PRECISION_CLASH,
   GameRematchCancelEvent,
   GameRematchEvent,
   GameReturnLobbyEvent,
@@ -26,6 +33,9 @@ import {
   LOBBY_SPAWN_PADDING,
   LOBBY_WIDTH,
   MATCH_COUNTDOWN_MS,
+  MATCH_MODE_CASUAL,
+  MATCH_MODE_RANKED,
+  MATCH_SOURCE_DIRECT_CHALLENGE,
   MATCH_TOTAL_ROUNDS,
   MatchFinishedEvent,
   MatchOpponentDisconnectedEvent,
@@ -36,34 +46,85 @@ import {
   ROUND_CYCLE_MS,
   ROUND_DURATION_MS,
   ROUND_PAUSE_MS,
+  RankedQueueCancelEvent,
+  RankedQueueJoinEvent,
   RematchCancelledEvent,
   RematchWaitingEvent,
   RoundResultEvent,
   RoundStartedEvent,
   RoundTapEvent,
   ServerWelcomeEvent,
+  VoiceTokenEvent,
+  isGameType,
   type ChallengeCancelledReason,
   type ChallengeFailedReason,
   type ClientHelloPayload,
   type ClientToServerEvents,
+  type CompetitionHistoryPayload,
+  type CrownRushStartedPayload,
+  type CurrentCompetitionPayload,
   type DistrictPlayersPayload,
+  type DistrictsLeaderboardPayload,
+  type GameType,
+  type HistoricalWeekDetail,
   type KeralaDistrict,
   type LobbyPlayer,
+  type MatchContext,
   type MatchFinishedPayload,
+  type MatchSettlementMap,
   type MatchStartedPayload,
   type PlayerJoinDistrictPayload,
   type PlayerMovePayload,
   type PlayerMovedPayload,
+  type PlayersLeaderboardPayload,
   type RoundResultPayload,
   type RoundScoreEntry,
   type ServerToClientEvents,
   type ServerWelcomePayload,
+  type VoiceTokenResponse,
 } from '@kerala-battle/shared';
+import { getDatabase } from './competition/db.js';
+import {
+  getDistrictLeaderboard,
+  getMyWeeklyStats,
+  getPlayerLeaderboard,
+  settleRankedMatch,
+  upsertPlayer,
+  type RankedPlayerInput,
+} from './competition/store.js';
+import { getCompetitionDay, getCompetitionWeek } from './competition/week.js';
+import { getOrCreateWeekConfig, type CompetitionWeekConfig } from './competition/featuredGame.js';
+import {
+  ensurePastWeeksFinalized,
+  finalizeCompetitionWeek,
+  getHistoryDetail,
+  getHistorySummaries,
+  getPreviousChampion,
+  HISTORY_DEFAULT_LIMIT,
+} from './competition/finalize.js';
+import { validateRankedMatch } from './competition/rankedMatch.js';
+import { RankedQueue } from './matchmaking/rankedQueue.js';
+import {
+  RankedMatchmaker,
+  rankedMatchContext,
+  type RankedPlayerInfo,
+} from './matchmaking/rankedMatchmaker.js';
+import { CrownRushRunner, type CrownRushFinishResult } from './games/crown-rush/runner.js';
+import { createVoiceToken, loadVoiceConfig } from './voice/token.js';
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3001;
 const WEB_URL = process.env.WEB_URL || 'http://localhost:5173';
+
+// LiveKit voice config. Null when credentials are absent: voice is then
+// disabled and every other feature keeps working normally.
+const voiceConfig = loadVoiceConfig();
+if (voiceConfig) {
+  console.log(`[voice] enabled (url=${voiceConfig.url})`);
+} else {
+  console.log('[voice] disabled: LIVEKIT_URL/API_KEY/API_SECRET not set');
+}
 
 /**
  * Runtime info for one connected socket. In-memory only, no database.
@@ -169,9 +230,162 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
+// ---------------------------------------------------------------------------
+// Competition leaderboards (current Asia/Kolkata week)
+// ---------------------------------------------------------------------------
+
+app.get('/api/leaderboards/players', (req, res) => {
+  try {
+    const week = getCompetitionWeek(Date.now());
+    const day = getCompetitionDay(Date.now());
+    const parsed = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 50;
+    const limit = Number.isNaN(parsed) ? 50 : Math.max(1, Math.min(100, parsed));
+    const playerId = typeof req.query.playerId === 'string' ? req.query.playerId : undefined;
+    const payload: PlayersLeaderboardPayload = {
+      week,
+      players: getPlayerLeaderboard(db, week.id, limit),
+      me: playerId ? getMyWeeklyStats(db, week.id, day.id, playerId) : null,
+    };
+    res.json(payload);
+  } catch (error) {
+    console.error('[competition] players leaderboard failed:', error);
+    res.status(500).json({ error: 'leaderboard unavailable' });
+  }
+});
+
+app.get('/api/leaderboards/districts', (_req, res) => {
+  try {
+    const week = getCompetitionWeek(Date.now());
+    const payload: DistrictsLeaderboardPayload = {
+      week,
+      districts: getDistrictLeaderboard(db, week.id),
+    };
+    res.json(payload);
+  } catch (error) {
+    console.error('[competition] districts leaderboard failed:', error);
+    res.status(500).json({ error: 'leaderboard unavailable' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Current competition: week boundaries + this week's featured ranked game
+// ---------------------------------------------------------------------------
+
+app.get('/api/competition/current', (_req, res) => {
+  try {
+    // Lazy recovery: finalizing past weeks must not depend on the process
+    // being awake at Monday 00:00, so every current-competition request also
+    // sweeps ended-but-unfinalized weeks.
+    ensurePastWeeksFinalized(db, { activeRankedMatchCountForWeek });
+    const config = getOrCreateWeekConfig(db, Date.now());
+    const payload: CurrentCompetitionPayload = {
+      week: {
+        id: config.competitionWeekId,
+        startsAt: config.startsAt,
+        endsAt: config.endsAt,
+      },
+      featuredGame: {
+        gameType: config.featuredGameType,
+        label: GAME_DEFINITIONS[config.featuredGameType].label,
+      },
+      previousChampion: getPreviousChampion(db, Date.now()),
+    };
+    res.json(payload);
+  } catch (error) {
+    console.error('[competition] current competition failed:', error);
+    res.status(500).json({ error: 'competition unavailable' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Competition history: finalized weeks only (immutable snapshots)
+// ---------------------------------------------------------------------------
+
+app.get('/api/competition/history', (req, res) => {
+  try {
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? rawLimit : HISTORY_DEFAULT_LIMIT;
+    const payload: CompetitionHistoryPayload = {
+      weeks: getHistorySummaries(db, limit),
+    };
+    res.json(payload);
+  } catch (error) {
+    console.error('[competition] history failed:', error);
+    res.status(500).json({ error: 'history unavailable' });
+  }
+});
+
+app.get('/api/competition/history/:weekId', (req, res) => {
+  try {
+    const weekId = req.params.weekId;
+    if (!/^\d{4}-W\d{1,2}$/.test(weekId)) {
+      res.status(400).json({ error: 'invalid week id' });
+      return;
+    }
+    const detail: HistoricalWeekDetail | null = getHistoryDetail(db, weekId);
+    if (!detail) {
+      res.status(404).json({ error: 'week not finalized' });
+      return;
+    }
+    res.json(detail);
+  } catch (error) {
+    console.error('[competition] history detail failed:', error);
+    res.status(500).json({ error: 'history unavailable' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// District voice: whether the LiveKit layer is configured
+// ---------------------------------------------------------------------------
+
+app.get('/api/voice/status', (_req, res) => {
+  res.json({ enabled: voiceConfig !== null });
+});
+
 const httpServer = createServer(app);
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
   cors: { origin: WEB_URL },
+});
+
+// Persistent competition database (SQLite). Migrations run on startup;
+// existing data is never deleted.
+const db = getDatabase();
+
+// ---------------------------------------------------------------------------
+// Weekly ranked battle queue (cross-district matchmaking)
+// ---------------------------------------------------------------------------
+
+const rankedQueue = new RankedQueue();
+const rankedMatchmaker = new RankedMatchmaker({
+  io,
+  queue: rankedQueue,
+  getPlayer: (socketId): RankedPlayerInfo | undefined => {
+    const player = connectedPlayers.get(socketId);
+    return player
+      ? {
+          socketId: player.socketId,
+          playerId: player.playerId,
+          displayName: player.displayName,
+          district: player.district,
+        }
+      : undefined;
+  },
+  isBusy: (playerId): boolean => busyByPlayerId.has(playerId),
+  hasPendingChallenge: (playerId): boolean =>
+    challengeByChallenger.has(playerId) || challengeByTarget.has(playerId),
+  getWeekConfig: (nowMs): CompetitionWeekConfig => getOrCreateWeekConfig(db, nowMs),
+  startRankedMatch: (a, b, week): void => {
+    const context = rankedMatchContext(a, b, week, Date.now());
+    const aInfo = { socketId: a.socketId, playerId: a.playerId, displayName: a.displayName };
+    const bInfo = { socketId: b.socketId, playerId: b.playerId, displayName: b.displayName };
+    // The featured game is dispatched through the existing game lifecycle;
+    // no game implementation is duplicated here.
+    if (week.featuredGameType === GAME_TYPE_CROWN_RUSH) {
+      createCrownRushMatch(aInfo, bInfo, context);
+    } else {
+      createMatch(aInfo, bInfo, context);
+    }
+  },
 });
 
 function broadcastPopulation(district: KeralaDistrict): void {
@@ -197,6 +411,7 @@ interface PendingChallenge {
   targetSocketId: string;
   targetPlayerId: string;
   district: KeralaDistrict;
+  gameType: GameType;
   timer: NodeJS.Timeout;
 }
 
@@ -245,7 +460,8 @@ interface MatchParticipant {
 
 interface ActiveMatch {
   matchId: string;
-  district: KeralaDistrict;
+  /** Server-authoritative: mode, source, week snapshot, district attribution. */
+  context: MatchContext;
   players: [MatchParticipant, MatchParticipant];
   round: number;
   totalRounds: number;
@@ -294,11 +510,15 @@ function labelForScore(score: number): string {
   return 'MISS!';
 }
 
-function createMatch(a: MatchParticipant, b: MatchParticipant, district: KeralaDistrict): void {
+function createMatch(
+  a: MatchParticipant,
+  b: MatchParticipant,
+  context: MatchContext,
+): void {
   const matchId = randomUUID();
   const match: ActiveMatch = {
     matchId,
-    district,
+    context,
     players: [a, b],
     round: 0,
     totalRounds: MATCH_TOTAL_ROUNDS,
@@ -320,16 +540,23 @@ function createMatch(a: MatchParticipant, b: MatchParticipant, district: KeralaD
   const serverNow = Date.now();
   const payload: MatchStartedPayload = {
     matchId,
+    gameType: GAME_TYPE_PRECISION_CLASH,
+    matchMode: context.matchMode,
+    matchSource: context.matchSource,
     players: [
       { playerId: a.playerId, displayName: a.displayName },
       { playerId: b.playerId, displayName: b.displayName },
     ],
+    districts: context.districts,
+    competitionWeekId: context.competitionWeekId,
     totalRounds: MATCH_TOTAL_ROUNDS,
     startsAt: serverNow + MATCH_COUNTDOWN_MS,
     serverNow,
   };
   io.to(matchRoom(matchId)).emit(MatchStartedEvent, payload);
-  console.log(`[match] ${matchId} created: ${a.displayName} vs ${b.displayName}`);
+  console.log(
+    `[match] ${matchId} created: ${a.displayName} vs ${b.displayName} (${context.matchMode}/${context.matchSource})`,
+  );
   match.roundTimer = setTimeout(() => startRound(matchId, 1), MATCH_COUNTDOWN_MS);
 }
 
@@ -388,11 +615,303 @@ function finishMatch(matchId: string): void {
   const [first, second] = totals;
   const winnerPlayerId =
     first.total === second.total ? null : first.total > second.total ? first.playerId : second.playerId;
-  const payload: MatchFinishedPayload = { matchId, totals, winnerPlayerId };
+
+  // Persistent competition settlement: server-authoritative, idempotent, and
+  // based on the same totals announced to the players. Only ranked matches
+  // settle; casual matches award nothing. District attribution comes from the
+  // snapshot taken when the server started the match, never the live profile.
+  const ranked = match.players.map((participant, index): RankedPlayerInput => {
+    const total = totals.find((entry) => entry.playerId === participant.playerId)?.total ?? 0;
+    return {
+      playerId: participant.playerId,
+      displayName: participant.displayName,
+      district: match.context.districts[index] ?? match.context.districts[0],
+      score: total,
+    };
+  });
+  const { settlement, competitionWeekId } =
+    ranked[0] && ranked[1]
+      ? settleRankedGame({
+          matchId,
+          gameType: GAME_TYPE_PRECISION_CLASH,
+          ranked: [ranked[0], ranked[1]],
+          winnerPlayerId,
+          context: match.context,
+        })
+      : { settlement: undefined, competitionWeekId: undefined };
+
+  const payload: MatchFinishedPayload = {
+    matchId,
+    gameType: GAME_TYPE_PRECISION_CLASH,
+    matchMode: match.context.matchMode,
+    matchSource: match.context.matchSource,
+    totals,
+    winnerPlayerId,
+    districts: match.context.districts,
+    competitionWeekId: match.context.competitionWeekId,
+    settlement,
+  };
   io.to(matchRoom(matchId)).emit(MatchFinishedEvent, payload);
+  if (competitionWeekId) {
+    // Lightweight ping; clients refetch leaderboard data themselves.
+    io.emit(CompetitionUpdatedEvent, { competitionWeekId });
+  }
   console.log(
     `[match] ${matchId} finished: ${totals.map((t) => `${t.displayName}=${t.total}`).join(', ')}`,
   );
+}
+
+/**
+ * Shared ranked-settlement path for every game type.
+ *
+ * Casual matches never settle: no ranking points, no district contribution,
+ * no leaderboard updates. Ranked matches pass central validation (ranked
+ * mode, weekly-queue source, featured game of the snapshotted week, two
+ * different districts) before any points are awarded. Settlement itself is
+ * server-authoritative and idempotent; a failure is logged but never breaks
+ * the result screen.
+ */
+function settleRankedGame(input: {
+  matchId: string;
+  gameType: GameType;
+  ranked: [RankedPlayerInput, RankedPlayerInput];
+  winnerPlayerId: string | null;
+  context: MatchContext;
+}): { settlement: MatchSettlementMap | undefined; competitionWeekId: string | undefined } {
+  if (input.context.matchMode !== MATCH_MODE_RANKED) {
+    return { settlement: undefined, competitionWeekId: undefined };
+  }
+  const validation = validateRankedMatch(db, {
+    matchId: input.matchId,
+    gameType: input.gameType,
+    matchMode: input.context.matchMode,
+    matchSource: input.context.matchSource,
+    competitionWeekId: input.context.competitionWeekId,
+    districts: input.context.districts,
+  });
+  if (!validation.ok) {
+    console.error(`[competition] refusing ranked settlement: ${validation.reason}`);
+    return { settlement: undefined, competitionWeekId: undefined };
+  }
+  try {
+    const outcome = settleRankedMatch(db, {
+      matchId: input.matchId,
+      gameType: input.gameType,
+      matchMode: input.context.matchMode,
+      matchSource: input.context.matchSource,
+      players: input.ranked,
+      winnerPlayerId: input.winnerPlayerId,
+      completedAtMs: Date.now(),
+      // Week-boundary rule: the result belongs to the week the server
+      // started the match, even if it finished after a rollover.
+      competitionWeekId: input.context.competitionWeekId,
+    });
+    // A settled ranked match may complete an ended week: attempt finalization.
+    maybeFinalizeWeek(outcome.weekId);
+    return { settlement: outcome.awards, competitionWeekId: outcome.weekId };
+  } catch (error) {
+    console.error(`[competition] settlement failed for match ${input.matchId}:`, error);
+    return { settlement: undefined, competitionWeekId: undefined };
+  }
+}
+
+/**
+ * Live count of unfinished ranked matches snapshotted to a competition week.
+ * Used to delay finalization until old-week matches settle (bounded by the
+ * grace period so a stuck match cannot block a week forever).
+ */
+function activeRankedMatchCountForWeek(weekId: string): number {
+  let count = 0;
+  for (const match of matches.values()) {
+    if (
+      match.status !== 'finished' &&
+      match.context.matchMode === MATCH_MODE_RANKED &&
+      match.context.competitionWeekId === weekId
+    ) {
+      count += 1;
+    }
+  }
+  for (const runner of crownRushMatches.values()) {
+    if (
+      runner.status !== 'finished' &&
+      runner.matchContext.matchMode === MATCH_MODE_RANKED &&
+      runner.matchContext.competitionWeekId === weekId
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Attempt to finalize a week; on success broadcast a lightweight
+ * competition:week-finalized event so clients refetch history data.
+ */
+function maybeFinalizeWeek(weekId: string): void {
+  const outcome = finalizeCompetitionWeek(db, weekId, {
+    activeRankedMatchCount: activeRankedMatchCountForWeek(weekId),
+  });
+  if (outcome.status !== 'finalized' || !outcome.champions) return;
+  io.emit(CompetitionWeekFinalizedEvent, {
+    competitionWeekId: weekId,
+    featuredGameType: outcome.champions.featuredGameType,
+    weeklyMaster: outcome.champions.weeklyMaster,
+    districtChampion: outcome.champions.districtChampion,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Crown Rush matches
+// ---------------------------------------------------------------------------
+
+const crownRushMatches = new Map<string, CrownRushRunner>();
+
+function createCrownRushMatch(
+  a: MatchParticipant,
+  b: MatchParticipant,
+  context: MatchContext,
+): void {
+  const runner = new CrownRushRunner(io, context.districts[0], [a, b], {
+    onFinish: (result) => finishCrownRushMatch(runner, result),
+    matchContext: context,
+  });
+  crownRushMatches.set(runner.matchId, runner);
+  for (const participant of [a, b]) {
+    io.sockets.sockets.get(participant.socketId)?.join(runner.matchRoom);
+    setBusy(participant.playerId, runner.matchId);
+  }
+  const serverNow = Date.now();
+  const payload: CrownRushStartedPayload = {
+    matchId: runner.matchId,
+    gameType: GAME_TYPE_CROWN_RUSH,
+    matchMode: context.matchMode,
+    matchSource: context.matchSource,
+    players: [
+      { playerId: a.playerId, displayName: a.displayName },
+      { playerId: b.playerId, displayName: b.displayName },
+    ],
+    districts: context.districts,
+    competitionWeekId: context.competitionWeekId,
+    startsAt: serverNow + MATCH_COUNTDOWN_MS,
+    serverNow,
+  };
+  io.to(runner.matchRoom).emit(CrownRushStartedEvent, payload);
+  console.log(
+    `[crownrush] ${runner.matchId} created: ${a.displayName} vs ${b.displayName} (${context.matchMode}/${context.matchSource})`,
+  );
+  runner.beginCountdown(MATCH_COUNTDOWN_MS);
+}
+
+function finishCrownRushMatch(runner: CrownRushRunner, result: CrownRushFinishResult): void {
+  const [a, b] = runner.players;
+  const context = runner.matchContext;
+  const toRanked = (
+    participant: MatchParticipant,
+    score: number,
+    district: KeralaDistrict,
+  ): RankedPlayerInput => ({
+    playerId: participant.playerId,
+    displayName: participant.displayName,
+    // Ranked: the district snapshotted at match start (historical attribution).
+    district,
+    score,
+  });
+  // Same reusable ranked settlement as Precision Clash; only the gameType differs.
+  // Casual matches settle nothing.
+  const { settlement, competitionWeekId } = settleRankedGame({
+    matchId: runner.matchId,
+    gameType: GAME_TYPE_CROWN_RUSH,
+    ranked: [toRanked(a, result.scores[0], context.districts[0]), toRanked(b, result.scores[1], context.districts[1])],
+    winnerPlayerId: result.winnerPlayerId,
+    context,
+  });
+  const payload: MatchFinishedPayload = {
+    matchId: runner.matchId,
+    gameType: GAME_TYPE_CROWN_RUSH,
+    matchMode: context.matchMode,
+    matchSource: context.matchSource,
+    totals: [
+      { playerId: a.playerId, displayName: a.displayName, total: result.scores[0] },
+      { playerId: b.playerId, displayName: b.displayName, total: result.scores[1] },
+    ],
+    winnerPlayerId: result.winnerPlayerId,
+    districts: context.districts,
+    competitionWeekId: context.competitionWeekId,
+    settlement,
+  };
+  io.to(runner.matchRoom).emit(MatchFinishedEvent, payload);
+  if (competitionWeekId) {
+    io.emit(CompetitionUpdatedEvent, { competitionWeekId });
+  }
+  console.log(
+    `[crownrush] ${runner.matchId} finished: ${a.displayName}=${result.scores[0]}, ${b.displayName}=${result.scores[1]}`,
+  );
+}
+
+/** A match of either game type, resolved by matchId. */
+type ResolvedMatch =
+  | { kind: 'precision'; match: ActiveMatch }
+  | { kind: 'crownrush'; runner: CrownRushRunner };
+
+function resolveMatch(matchId: unknown): ResolvedMatch | undefined {
+  if (typeof matchId !== 'string') return undefined;
+  const match = matches.get(matchId);
+  if (match) return { kind: 'precision', match };
+  const runner = crownRushMatches.get(matchId);
+  if (runner) return { kind: 'crownrush', runner };
+  return undefined;
+}
+
+function resolveParticipant(
+  resolved: ResolvedMatch,
+  socketId: string,
+): MatchParticipant | undefined {
+  const players = resolved.kind === 'precision' ? resolved.match.players : resolved.runner.players;
+  return players.find((participant) => participant.socketId === socketId);
+}
+
+/** Rematch flow for Crown Rush: a brand-new match, 0-0, new matchId, same game. */
+function handleCrownRushRematch(
+  socket: Socket<ClientToServerEvents, ServerToClientEvents>,
+  runner: CrownRushRunner,
+): void {
+  if (runner.status !== 'finished') return;
+  const me = runner.players.find((participant) => participant.socketId === socket.id);
+  if (!me || runner.returnedToLobby.has(me.playerId)) return;
+  runner.rematchWants.add(me.playerId);
+  const other = runner.players.find((participant) => participant.playerId !== me.playerId);
+  if (!other) return;
+  if (runner.rematchWants.has(other.playerId) && !runner.returnedToLobby.has(other.playerId)) {
+    const meConn = findPlayerById(me.playerId);
+    const otherConn = findPlayerById(other.playerId);
+    if (!meConn || !otherConn) {
+      socket.emit(RematchCancelledEvent, { matchId: runner.matchId });
+      return;
+    }
+    for (const participant of runner.players) {
+      io.sockets.sockets.get(participant.socketId)?.leave(runner.matchRoom);
+    }
+    runner.destroy();
+    crownRushMatches.delete(runner.matchId);
+    // Rematches are always casual, even after a ranked match: ranked points
+    // can only ever come from the weekly queue (anti-farming).
+    createCrownRushMatch(
+      { socketId: meConn.socketId, playerId: meConn.playerId, displayName: meConn.displayName },
+      {
+        socketId: otherConn.socketId,
+        playerId: otherConn.playerId,
+        displayName: otherConn.displayName,
+      },
+      {
+        matchMode: MATCH_MODE_CASUAL,
+        matchSource: MATCH_SOURCE_DIRECT_CHALLENGE,
+        districts: [meConn.district, otherConn.district],
+        startedAtMs: Date.now(),
+      },
+    );
+  } else {
+    socket.emit(RematchWaitingEvent, { matchId: runner.matchId });
+  }
 }
 
 function getMatch(matchId: unknown): ActiveMatch | undefined {
@@ -422,6 +941,20 @@ io.on('connection', (socket) => {
       return;
     }
     const previous = connectedPlayers.get(socket.id);
+    // A queued or in-match player cannot switch district mid-flow: cancel the
+    // queue first, or finish/leave the match. The client disables the button,
+    // but the server enforces it too.
+    if (previous && previous.district !== payload.district) {
+      if (rankedMatchmaker.isQueued(socket.id)) {
+        rankedMatchmaker.cancel(socket.id);
+      }
+      if (busyByPlayerId.has(previous.playerId)) {
+        console.log(
+          `[district] ${previous.displayName} tried to switch district mid-match; ignored`,
+        );
+        return;
+      }
+    }
     // A brand-new socket (or a district switch) gets a fresh spawn point.
     // A same-socket re-join of the same district keeps its position.
     const spawn =
@@ -438,6 +971,12 @@ io.on('connection', (socket) => {
       inMatch: previous?.inMatch ?? false,
     };
     connectedPlayers.set(socket.id, next);
+    // Persist the guest identity; a district switch updates the same row.
+    try {
+      upsertPlayer(db, next.playerId, next.displayName, next.district, Date.now());
+    } catch (error) {
+      console.error('[competition] upsertPlayer failed:', error);
+    }
 
     if (previous && previous.district !== next.district) {
       socket.leave(districtRoom(previous.district));
@@ -470,10 +1009,15 @@ io.on('connection', (socket) => {
       typeof payload === 'object' && payload !== null
         ? (payload as { targetPlayerId?: unknown }).targetPlayerId
         : undefined;
+    const gameType =
+      typeof payload === 'object' && payload !== null
+        ? (payload as { gameType?: unknown }).gameType
+        : undefined;
     const fail = (reason: ChallengeFailedReason): void => {
       socket.emit(ChallengeFailedEvent, { reason });
     };
     if (!challenger || typeof targetPlayerId !== 'string') return;
+    if (!isGameType(gameType)) return fail('invalid-game');
     const target = findPlayerById(targetPlayerId);
     if (!target) return fail('target-not-found');
     if (target.playerId === challenger.playerId) return fail('self-challenge');
@@ -484,6 +1028,8 @@ io.on('connection', (socket) => {
     if (challengeByChallenger.has(challenger.playerId) || challengeByTarget.has(target.playerId)) {
       return fail('already-pending');
     }
+    // A direct challenge replaces queueing: the challenger chose a casual game.
+    rankedMatchmaker.evictPlayer(challenger.playerId);
     const challengeId = randomUUID();
     const challenge: PendingChallenge = {
       challengeId,
@@ -493,6 +1039,7 @@ io.on('connection', (socket) => {
       targetSocketId: target.socketId,
       targetPlayerId: target.playerId,
       district: challenger.district,
+      gameType,
       timer: setTimeout(() => expireChallenge(challengeId), CHALLENGE_EXPIRY_MS),
     };
     challenges.set(challengeId, challenge);
@@ -501,8 +1048,13 @@ io.on('connection', (socket) => {
     io.to(target.socketId).emit(ChallengeReceivedEvent, {
       challengeId,
       challenger: { playerId: challenger.playerId, displayName: challenger.displayName },
+      gameType,
+      // Direct challenges are always casual; the server decides the mode.
+      matchMode: MATCH_MODE_CASUAL,
     });
-    console.log(`[challenge] ${challengeId}: ${challenger.displayName} -> ${target.displayName}`);
+    console.log(
+      `[challenge] ${challengeId}: ${challenger.displayName} -> ${target.displayName} (${gameType})`,
+    );
   });
 
   socket.on(ChallengeAcceptEvent, (payload) => {
@@ -521,15 +1073,33 @@ io.on('connection', (socket) => {
     if (busyByPlayerId.has(challenger.playerId) || busyByPlayerId.has(target.playerId)) {
       return fail('unavailable');
     }
-    createMatch(
-      {
-        socketId: challenger.socketId,
-        playerId: challenger.playerId,
-        displayName: challenger.displayName,
-      },
-      { socketId: target.socketId, playerId: target.playerId, displayName: target.displayName },
-      challenger.district,
-    );
+    // Neither side may stay queued: the accepted challenge becomes their match.
+    rankedMatchmaker.evictPlayer(challenger.playerId);
+    rankedMatchmaker.evictPlayer(target.playerId);
+    const challengerInfo = {
+      socketId: challenger.socketId,
+      playerId: challenger.playerId,
+      displayName: challenger.displayName,
+    };
+    const targetInfo = {
+      socketId: target.socketId,
+      playerId: target.playerId,
+      displayName: target.displayName,
+    };
+    // Direct challenges are always casual. The server decides the mode; the
+    // client can never turn a direct challenge into a ranked game.
+    const context: MatchContext = {
+      matchMode: MATCH_MODE_CASUAL,
+      matchSource: MATCH_SOURCE_DIRECT_CHALLENGE,
+      districts: [challenger.district, challenger.district],
+      startedAtMs: Date.now(),
+    };
+    // The challenge lifecycle is shared; only match creation is game-specific.
+    if (challenge.gameType === GAME_TYPE_CROWN_RUSH) {
+      createCrownRushMatch(challengerInfo, targetInfo, context);
+    } else {
+      createMatch(challengerInfo, targetInfo, context);
+    }
   });
 
   socket.on(ChallengeDeclineEvent, (payload) => {
@@ -555,7 +1125,63 @@ io.on('connection', (socket) => {
     notifyChallengeCancelled(challenge, 'withdrawn');
   });
 
+  // ------------------------- weekly ranked queue -------------------------
+
+  socket.on(RankedQueueJoinEvent, () => {
+    // The payload carries nothing: game, week, district and identity are
+    // all server-decided inside the matchmaker.
+    rankedMatchmaker.join(socket.id);
+  });
+
+  socket.on(RankedQueueCancelEvent, () => {
+    rankedMatchmaker.cancel(socket.id);
+  });
+
+  // ------------------------- district voice (LiveKit tokens) -------------------------
+
+  socket.on(VoiceTokenEvent, (_payload, callback) => {
+    // Identity and district come from the server's connected-player state,
+    // never from the payload: a client cannot request another player's
+    // identity or another district's voice room through this protocol.
+    const player = connectedPlayers.get(socket.id);
+    if (!player) {
+      const response: VoiceTokenResponse = { ok: false, error: 'not-registered' };
+      callback(response);
+      return;
+    }
+    if (!voiceConfig) {
+      const response: VoiceTokenResponse = { ok: false, error: 'voice-disabled' };
+      callback(response);
+      return;
+    }
+    createVoiceToken(voiceConfig, {
+      playerId: player.playerId,
+      displayName: player.displayName,
+      district: player.district,
+    })
+      .then(({ token, url, roomName }) => {
+        const response: VoiceTokenResponse = { ok: true, token, url, roomName };
+        callback(response);
+      })
+      .catch((error) => {
+        console.error('[voice] token issuance failed:', error);
+        const response: VoiceTokenResponse = { ok: false, error: 'voice-disabled' };
+        callback(response);
+      });
+  });
+
   // ------------------------- match play -------------------------
+
+  socket.on(CrownRushInputEvent, (payload) => {
+    // The runner validates the payload and identifies the player from the
+    // socket; clients never submit positions or playerIds.
+    const matchId =
+      typeof payload === 'object' && payload !== null
+        ? (payload as { matchId?: unknown }).matchId
+        : undefined;
+    if (typeof matchId !== 'string') return;
+    crownRushMatches.get(matchId)?.handleInput(socket.id, payload);
+  });
 
   socket.on(GameTapEvent, (payload) => {
     const match = getMatch(payload?.matchId);
@@ -577,8 +1203,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on(GameRematchEvent, (payload) => {
-    const match = getMatch(payload?.matchId);
-    if (!match || match.status !== 'finished') return;
+    const resolved = resolveMatch(payload?.matchId);
+    if (!resolved) return;
+    if (resolved.kind === 'crownrush') return handleCrownRushRematch(socket, resolved.runner);
+    const match = resolved.match;
+    if (match.status !== 'finished') return;
     const me = participantOf(match, socket.id);
     if (!me || match.returnedToLobby.has(me.playerId)) return;
     match.rematchWants.add(me.playerId);
@@ -587,7 +1216,7 @@ io.on('connection', (socket) => {
     if (match.rematchWants.has(other.playerId) && !match.returnedToLobby.has(other.playerId)) {
       const meConn = findPlayerById(me.playerId);
       const otherConn = findPlayerById(other.playerId);
-      if (!meConn || !otherConn || meConn.district !== otherConn.district) {
+      if (!meConn || !otherConn) {
         socket.emit(RematchCancelledEvent, { matchId: match.matchId });
         return;
       }
@@ -595,6 +1224,8 @@ io.on('connection', (socket) => {
         io.sockets.sockets.get(participant.socketId)?.leave(matchRoom(match.matchId));
       }
       matches.delete(match.matchId);
+      // Rematches are always casual, even after a ranked match: ranked points
+      // can only ever come from the weekly queue (anti-farming).
       createMatch(
         { socketId: meConn.socketId, playerId: meConn.playerId, displayName: meConn.displayName },
         {
@@ -602,7 +1233,12 @@ io.on('connection', (socket) => {
           playerId: otherConn.playerId,
           displayName: otherConn.displayName,
         },
-        meConn.district,
+        {
+          matchMode: MATCH_MODE_CASUAL,
+          matchSource: MATCH_SOURCE_DIRECT_CHALLENGE,
+          districts: [meConn.district, otherConn.district],
+          startedAtMs: Date.now(),
+        },
       );
     } else {
       socket.emit(RematchWaitingEvent, { matchId: match.matchId });
@@ -610,27 +1246,49 @@ io.on('connection', (socket) => {
   });
 
   socket.on(GameRematchCancelEvent, (payload) => {
-    const match = getMatch(payload?.matchId);
-    if (!match || match.status !== 'finished') return;
+    const resolved = resolveMatch(payload?.matchId);
+    if (!resolved) return;
+    if (resolved.kind === 'crownrush') {
+      const runner = resolved.runner;
+      if (runner.status !== 'finished') return;
+      const me = resolveParticipant(resolved, socket.id);
+      if (me) runner.rematchWants.delete(me.playerId);
+      return;
+    }
+    const match = resolved.match;
+    if (match.status !== 'finished') return;
     const me = participantOf(match, socket.id);
     if (me) match.rematchWants.delete(me.playerId);
   });
 
   socket.on(GameReturnLobbyEvent, (payload) => {
     const player = connectedPlayers.get(socket.id);
-    const match = getMatch(payload?.matchId);
-    const participant = match ? participantOf(match, socket.id) : undefined;
-    if (match && participant) {
-      match.returnedToLobby.add(participant.playerId);
-      match.rematchWants.delete(participant.playerId);
-      socket.leave(matchRoom(match.matchId));
-      const other = match.players.find((p) => p.playerId !== participant.playerId);
+    const resolved = resolveMatch(payload?.matchId);
+    const participant = resolved ? resolveParticipant(resolved, socket.id) : undefined;
+    if (resolved && participant) {
+      const matchId = resolved.kind === 'precision' ? resolved.match.matchId : resolved.runner.matchId;
+      const players = resolved.kind === 'precision' ? resolved.match.players : resolved.runner.players;
+      const rematchWants =
+        resolved.kind === 'precision' ? resolved.match.rematchWants : resolved.runner.rematchWants;
+      const returnedToLobby =
+        resolved.kind === 'precision'
+          ? resolved.match.returnedToLobby
+          : resolved.runner.returnedToLobby;
+      returnedToLobby.add(participant.playerId);
+      rematchWants.delete(participant.playerId);
+      socket.leave(matchRoom(matchId));
+      const other = players.find((p) => p.playerId !== participant.playerId);
       const otherSocket = other ? io.sockets.sockets.get(other.socketId) : undefined;
-      if (other && match.rematchWants.has(other.playerId) && otherSocket) {
-        otherSocket.emit(RematchCancelledEvent, { matchId: match.matchId });
+      if (other && rematchWants.has(other.playerId) && otherSocket) {
+        otherSocket.emit(RematchCancelledEvent, { matchId });
       }
-      if (match.returnedToLobby.size >= match.players.length) {
-        matches.delete(match.matchId);
+      if (returnedToLobby.size >= players.length) {
+        if (resolved.kind === 'precision') {
+          matches.delete(matchId);
+        } else {
+          resolved.runner.destroy();
+          crownRushMatches.delete(matchId);
+        }
       }
     }
     if (player) setBusy(player.playerId, null);
@@ -641,6 +1299,10 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     const player = connectedPlayers.get(socket.id);
+
+    // A queued player leaves the queue immediately: no ghost entries, no
+    // ghost matches later. Pending match-found intros are aborted safely.
+    rankedMatchmaker.handleDisconnect(socket.id);
 
     // Pending challenges involving this socket are cancelled.
     for (const [challengeId, challenge] of challenges) {
@@ -662,25 +1324,59 @@ io.on('connection', (socket) => {
     if (player) {
       const matchId = busyByPlayerId.get(player.playerId);
       busyByPlayerId.delete(player.playerId);
-      const match = matchId ? matches.get(matchId) : undefined;
-      if (match) {
-        const other = match.players.find((p) => p.playerId !== player.playerId);
+      const resolved = matchId ? resolveMatch(matchId) : undefined;
+      if (resolved) {
+        const other =
+          resolved.kind === 'precision'
+            ? resolved.match.players.find((p) => p.playerId !== player.playerId)
+            : resolved.runner.players.find((p) => p.playerId !== player.playerId);
         const otherSocket = other ? io.sockets.sockets.get(other.socketId) : undefined;
-        if (match.status !== 'finished') {
+        const isFinished =
+          resolved.kind === 'precision'
+            ? resolved.match.status === 'finished'
+            : resolved.runner.status === 'finished';
+        if (!isFinished) {
+          // No ranked settlement for an incomplete/disconnected match.
           if (otherSocket) {
-            otherSocket.emit(MatchOpponentDisconnectedEvent, { matchId: match.matchId });
+            const goneId =
+              resolved.kind === 'precision' ? resolved.match.matchId : resolved.runner.matchId;
+            otherSocket.emit(MatchOpponentDisconnectedEvent, { matchId: goneId });
           }
-          if (match.roundTimer) clearTimeout(match.roundTimer);
-          matches.delete(match.matchId);
-          console.log(`[match] ${match.matchId} aborted: opponent disconnected`);
-        } else {
-          match.returnedToLobby.add(player.playerId);
-          match.rematchWants.delete(player.playerId);
-          if (other && match.rematchWants.has(other.playerId) && otherSocket) {
-            otherSocket.emit(RematchCancelledEvent, { matchId: match.matchId });
-          }
-          if (match.returnedToLobby.size >= match.players.length) {
+          if (resolved.kind === 'precision') {
+            const match = resolved.match;
+            if (match.roundTimer) clearTimeout(match.roundTimer);
             matches.delete(match.matchId);
+            console.log(`[match] ${match.matchId} aborted: opponent disconnected`);
+          } else {
+            const runner = resolved.runner;
+            runner.destroy();
+            crownRushMatches.delete(runner.matchId);
+            console.log(`[crownrush] ${runner.matchId} aborted: opponent disconnected`);
+          }
+        } else {
+          const rematchWants =
+            resolved.kind === 'precision'
+              ? resolved.match.rematchWants
+              : resolved.runner.rematchWants;
+          const returnedToLobby =
+            resolved.kind === 'precision'
+              ? resolved.match.returnedToLobby
+              : resolved.runner.returnedToLobby;
+          const goneId =
+            resolved.kind === 'precision' ? resolved.match.matchId : resolved.runner.matchId;
+          returnedToLobby.add(player.playerId);
+          rematchWants.delete(player.playerId);
+          if (other && rematchWants.has(other.playerId) && otherSocket) {
+            otherSocket.emit(RematchCancelledEvent, { matchId: goneId });
+          }
+          const playerCount =
+            resolved.kind === 'precision' ? resolved.match.players.length : resolved.runner.players.length;
+          if (returnedToLobby.size >= playerCount) {
+            if (resolved.kind === 'precision') matches.delete(goneId);
+            else {
+              resolved.runner.destroy();
+              crownRushMatches.delete(goneId);
+            }
           }
         }
       }
@@ -700,3 +1396,36 @@ io.on('connection', (socket) => {
 httpServer.listen(PORT, () => {
   console.log(`Kerala Battle server listening on http://localhost:${PORT}`);
 });
+
+// Week-finalization recovery: finalize any ended but unfinalized weeks left
+// behind by downtime. Correctness never depends on being awake at Monday
+// 00:00: the current-competition endpoint and post-settlement hooks sweep too.
+{
+  const recovered = ensurePastWeeksFinalized(db, { activeRankedMatchCountForWeek });
+  if (recovered.finalized.length > 0 || recovered.delayed.length > 0) {
+    console.log(
+      `[competition] startup recovery: finalized [${recovered.finalized.join(', ')}]` +
+        (recovered.delayed.length > 0 ? ` delayed [${recovered.delayed.join(', ')}]` : ''),
+    );
+  }
+}
+
+// Periodic sweep (60s): catches week ends while the process stays up. Cheap:
+// it only attempts work for ended, unfinalized weeks.
+setInterval(() => {
+  try {
+    const swept = ensurePastWeeksFinalized(db, { activeRankedMatchCountForWeek });
+    for (const weekId of swept.finalized) {
+      const detail = getHistoryDetail(db, weekId);
+      if (!detail) continue;
+      io.emit(CompetitionWeekFinalizedEvent, {
+        competitionWeekId: weekId,
+        featuredGameType: detail.featuredGameType,
+        weeklyMaster: detail.weeklyMaster,
+        districtChampion: detail.districtChampion,
+      });
+    }
+  } catch (error) {
+    console.error('[competition] periodic finalization sweep failed:', error);
+  }
+}, 60_000);

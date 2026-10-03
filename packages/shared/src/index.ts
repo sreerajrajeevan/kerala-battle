@@ -58,6 +58,76 @@ export interface PlayerProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Game types (multi-game support)
+// ---------------------------------------------------------------------------
+
+/** Precision Clash 1v1 game-type identifier. */
+export const GAME_TYPE_PRECISION_CLASH = 'precision-clash' as const;
+/** Crown Rush 1v1 game-type identifier. */
+export const GAME_TYPE_CROWN_RUSH = 'crown-rush' as const;
+
+/** All supported ranked game types. Use the constants; never hard-code game strings. */
+export type GameType = typeof GAME_TYPE_PRECISION_CLASH | typeof GAME_TYPE_CROWN_RUSH;
+
+export function isGameType(value: unknown): value is GameType {
+  return value === GAME_TYPE_PRECISION_CLASH || value === GAME_TYPE_CROWN_RUSH;
+}
+
+/** Small game registry: display metadata per game type. */
+export const GAME_DEFINITIONS: Record<GameType, { label: string; tagline: string }> = {
+  [GAME_TYPE_PRECISION_CLASH]: { label: 'Precision Clash', tagline: 'Precision Clash · 3 rounds' },
+  [GAME_TYPE_CROWN_RUSH]: { label: 'Crown Rush', tagline: 'Crown Rush · first to 7 crowns' },
+};
+
+// ---------------------------------------------------------------------------
+// Match mode + source (ranked weekly queue vs casual direct challenges)
+// ---------------------------------------------------------------------------
+
+/** Casual match: direct player challenge. Awards no ranking points. */
+export const MATCH_MODE_CASUAL = 'casual' as const;
+/** Ranked match: originated from the weekly battle queue. Settles into rankings. */
+export const MATCH_MODE_RANKED = 'ranked' as const;
+
+/** How a match was created. The server decides this authoritatively. */
+export type MatchMode = typeof MATCH_MODE_CASUAL | typeof MATCH_MODE_RANKED;
+
+/** Match created from a direct player-to-player challenge. */
+export const MATCH_SOURCE_DIRECT_CHALLENGE = 'direct-challenge' as const;
+/** Match created from the weekly ranked battle queue. */
+export const MATCH_SOURCE_WEEKLY_QUEUE = 'weekly-queue' as const;
+
+/** Where a match came from. The server decides this authoritatively. */
+export type MatchSource = typeof MATCH_SOURCE_DIRECT_CHALLENGE | typeof MATCH_SOURCE_WEEKLY_QUEUE;
+
+export function isMatchMode(value: unknown): value is MatchMode {
+  return value === MATCH_MODE_CASUAL || value === MATCH_MODE_RANKED;
+}
+
+export function isMatchSource(value: unknown): value is MatchSource {
+  return value === MATCH_SOURCE_DIRECT_CHALLENGE || value === MATCH_SOURCE_WEEKLY_QUEUE;
+}
+
+/**
+ * Server-authoritative context for one match. Direct challenges are always
+ * casual; only the weekly queue produces ranked matches. The client never
+ * decides the mode.
+ */
+export interface MatchContext {
+  matchMode: MatchMode;
+  matchSource: MatchSource;
+  /**
+   * Ranked matches only: the competition week (by server match-start time)
+   * the result settles into. Snapshotted at start so a week boundary
+   * mid-match cannot move the result.
+   */
+  competitionWeekId?: string;
+  /** District each player represents, aligned with the players array order. */
+  districts: [KeralaDistrict, KeralaDistrict];
+  /** Unix ms when the server started the match. */
+  startedAtMs: number;
+}
+
+// ---------------------------------------------------------------------------
 // District room events
 // ---------------------------------------------------------------------------
 
@@ -154,6 +224,7 @@ export const ChallengeFailedEvent = 'challenge:failed' as const;
 
 export interface ChallengeSendPayload {
   targetPlayerId: string;
+  gameType: GameType;
 }
 
 export interface ChallengeReceivedPayload {
@@ -162,6 +233,9 @@ export interface ChallengeReceivedPayload {
     playerId: string;
     displayName: string;
   };
+  gameType: GameType;
+  /** Direct challenges are always casual. */
+  matchMode: MatchMode;
 }
 
 export interface ChallengeAcceptPayload {
@@ -196,7 +270,8 @@ export type ChallengeFailedReason =
   | 'different-district'
   | 'self-challenge'
   | 'busy'
-  | 'already-pending';
+  | 'already-pending'
+  | 'invalid-game';
 
 export interface ChallengeFailedPayload {
   reason: ChallengeFailedReason;
@@ -251,7 +326,15 @@ export interface MatchPlayerInfo {
 
 export interface MatchStartedPayload {
   matchId: string;
+  gameType: GameType;
+  /** Server-authoritative: direct challenges are always casual. */
+  matchMode: MatchMode;
+  matchSource: MatchSource;
   players: [MatchPlayerInfo, MatchPlayerInfo];
+  /** District each player represents, aligned with the players array order. */
+  districts: [KeralaDistrict, KeralaDistrict];
+  /** Ranked matches: the competition week (by server match-start time). */
+  competitionWeekId?: string;
   totalRounds: number;
   /** Server timestamp (ms) when round 1 begins. */
   startsAt: number;
@@ -296,9 +379,22 @@ export interface MatchTotalEntry {
 
 export interface MatchFinishedPayload {
   matchId: string;
+  gameType: GameType;
+  /** Server-authoritative: direct challenges are always casual. */
+  matchMode: MatchMode;
+  matchSource: MatchSource;
   totals: MatchTotalEntry[];
   /** Null on a draw. */
   winnerPlayerId: string | null;
+  /** District each player represented, aligned with the players/totals order. */
+  districts: [KeralaDistrict, KeralaDistrict];
+  /** Ranked matches: the competition week (by server match-start time). */
+  competitionWeekId?: string;
+  /**
+   * Server-computed ranking awards, keyed by playerId. Present only when the
+   * server settled this match into the persistent competition (ranked only).
+   */
+  settlement?: MatchSettlementMap;
 }
 
 export interface MatchOpponentDisconnectedPayload {
@@ -331,6 +427,422 @@ export interface RematchCancelledPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent competition (weekly personal + district rankings)
+// ---------------------------------------------------------------------------
+
+/** IANA timezone for all competition-day and weekly-boundary calculations. */
+export const COMPETITION_TIMEZONE = 'Asia/Kolkata' as const;
+
+/** Personal weekly points for a win (before the completion bonus). */
+export const COMPETITION_POINTS_WIN = 10;
+/** Personal weekly points for a draw (before the completion bonus). */
+export const COMPETITION_POINTS_DRAW = 6;
+/** Personal weekly points for a loss (before the completion bonus). */
+export const COMPETITION_POINTS_LOSS = 3;
+/** Bonus awarded for completing a legitimate match (all rounds played). */
+export const COMPETITION_POINTS_COMPLETION_BONUS = 2;
+/** Maximum district points a single player can contribute per competition day. */
+export const COMPETITION_DAILY_DISTRICT_CAP = 50;
+
+/**
+ * Server broadcasts this to all clients after settling a completed match.
+ * The payload is intentionally tiny; clients refetch leaderboard data.
+ */
+export const CompetitionUpdatedEvent = 'competition:updated' as const;
+
+export interface CompetitionUpdatedPayload {
+  competitionWeekId: string;
+}
+
+/**
+ * Server broadcasts this when a competition week becomes finalized (champions
+ * crowned, history snapshotted). Lightweight: clients refetch history data.
+ */
+export const CompetitionWeekFinalizedEvent = 'competition:week-finalized' as const;
+
+export interface WeeklyMasterSummary {
+  playerId: string;
+  displayName: string;
+  district: KeralaDistrict;
+  points: number;
+  wins: number;
+  matchesPlayed: number;
+}
+
+export interface DistrictChampionSummary {
+  district: KeralaDistrict;
+  points: number;
+  wins: number;
+  activePlayers: number;
+}
+
+export interface WeekFinalizedPayload {
+  competitionWeekId: string;
+  featuredGameType: GameType;
+  weeklyMaster: WeeklyMasterSummary | null;
+  districtChampion: DistrictChampionSummary | null;
+}
+
+/** One player's immutable snapshot row for a finalized week. */
+export interface HistoricalPlayerResult {
+  rank: number;
+  playerId: string;
+  /** Display name as snapshotted at finalization (renames don't rewrite history). */
+  displayName: string;
+  /** District the player represented during that week (not their current one). */
+  district: KeralaDistrict;
+  points: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  matchesPlayed: number;
+}
+
+/** One district's immutable snapshot row for a finalized week. */
+export interface HistoricalDistrictResult {
+  rank: number;
+  district: KeralaDistrict;
+  points: number;
+  wins: number;
+  activePlayers: number;
+  pointsPerActivePlayer: number;
+}
+
+/** A finalized week: champions + metadata, without the full standings. */
+export interface HistoricalWeekSummary {
+  competitionWeekId: string;
+  featuredGameType: GameType;
+  featuredGameLabel: string;
+  startsAt: string;
+  endsAt: string;
+  /** Unix ms when the week was finalized. */
+  finalizedAt: number;
+  weeklyMaster: WeeklyMasterSummary | null;
+  districtChampion: DistrictChampionSummary | null;
+}
+
+/** A finalized week with its complete snapshotted standings. */
+export interface HistoricalWeekDetail extends HistoricalWeekSummary {
+  players: HistoricalPlayerResult[];
+  districts: HistoricalDistrictResult[];
+}
+
+export interface CompetitionHistoryPayload {
+  weeks: HistoricalWeekSummary[];
+}
+
+/** The most recently finalized week before the current one, if any. */
+export interface PreviousChampionInfo {
+  weekId: string;
+  weeklyMaster: WeeklyMasterSummary | null;
+  districtChampion: DistrictChampionSummary | null;
+}
+
+/** One competition week: stable ID plus exact Asia/Kolkata boundaries. */
+export interface CompetitionWeekInfo {
+  /** Stable ID, e.g. "2026-W40". */
+  id: string;
+  /** Monday 00:00:00 IST, ISO 8601 with +05:30 offset. */
+  startsAt: string;
+  /** Sunday 23:59:59.999 IST, ISO 8601 with +05:30 offset. */
+  endsAt: string;
+}
+
+/**
+ * Server-computed awards for one player from one settled match.
+ * The client never calculates these; it only displays them.
+ */
+export interface PlayerSettlement {
+  /** Weekly personal points earned for this match (result + completion bonus). */
+  personalPointsAwarded: number;
+  /** District points actually credited after applying the daily cap. */
+  districtPointsAwarded: number;
+  /** Player's total weekly personal points after this match. */
+  weeklyPersonalPoints: number;
+  /** District contribution the player has used today, after this match. */
+  dailyDistrictContribution: number;
+  /** The daily district contribution cap in effect. */
+  dailyDistrictContributionCap: number;
+  /** District that received the district points (attribution at match time). */
+  district: KeralaDistrict;
+}
+
+/** Settlement results for a finished match, keyed by playerId. */
+export type MatchSettlementMap = Record<string, PlayerSettlement>;
+
+export interface PlayerLeaderboardEntry {
+  rank: number;
+  playerId: string;
+  displayName: string;
+  district: KeralaDistrict;
+  points: number;
+  wins: number;
+  matchesPlayed: number;
+}
+
+/** The requesting player's own weekly stats; null when they have no ranked matches. */
+export interface MyWeeklyStats {
+  rank: number;
+  points: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  matchesPlayed: number;
+  /** 0..1 */
+  winRate: number;
+  district: KeralaDistrict;
+  dailyDistrictContribution: number;
+  dailyDistrictContributionCap: number;
+}
+
+export interface PlayersLeaderboardPayload {
+  week: CompetitionWeekInfo;
+  players: PlayerLeaderboardEntry[];
+  me: MyWeeklyStats | null;
+}
+
+export interface DistrictLeaderboardEntry {
+  rank: number;
+  district: KeralaDistrict;
+  /** Sum of capped district contributions for the week. */
+  points: number;
+  /** Players with at least one completed match this week. */
+  activePlayers: number;
+  wins: number;
+  /** Informational only; ranking stays on total points. */
+  pointsPerActivePlayer: number;
+}
+
+export interface DistrictsLeaderboardPayload {
+  week: CompetitionWeekInfo;
+  districts: DistrictLeaderboardEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// Crown Rush (second 1v1 game)
+// ---------------------------------------------------------------------------
+
+/** Crown Rush uses the same logical coordinate space as the district lobby. */
+export const CROWN_RUSH_ARENA_WIDTH = LOBBY_WIDTH;
+export const CROWN_RUSH_ARENA_HEIGHT = LOBBY_HEIGHT;
+/** Player collision radius (world units). */
+export const CROWN_RUSH_PLAYER_RADIUS = 24;
+/** Crown pickup radius (world units). */
+export const CROWN_RUSH_CROWN_RADIUS = 20;
+/** Capture when the player center is within player radius + crown radius. */
+export const CROWN_RUSH_CAPTURE_DISTANCE = CROWN_RUSH_PLAYER_RADIUS + CROWN_RUSH_CROWN_RADIUS;
+/** Authoritative movement speed (world units per second). */
+export const CROWN_RUSH_MOVE_SPEED = 260;
+/** First player to this many crowns wins immediately. */
+export const CROWN_RUSH_WIN_SCORE = 7;
+/** Normal match duration. */
+export const CROWN_RUSH_DURATION_MS = 45000;
+/** Sudden-death failsafe: relocate the golden crown instead of declaring a draw. */
+export const CROWN_RUSH_SUDDEN_DEATH_FAILSAFE_MS = 30000;
+/** Delay before a new crown spawns after a capture. */
+export const CROWN_RUSH_RESPAWN_DELAY_MS = 500;
+/** Crown spawn padding from arena edges. */
+export const CROWN_RUSH_SPAWN_PADDING = 80;
+/** Minimum crown distance from each player at spawn. */
+export const CROWN_RUSH_MIN_SPAWN_DISTANCE = 150;
+/** Fixed starting positions (opposite sides, never overlapping). */
+export const CROWN_RUSH_SPAWN_A = { x: 180, y: 350 } as const;
+export const CROWN_RUSH_SPAWN_B = { x: 820, y: 350 } as const;
+
+/** Client submits movement input (never positions). */
+export const CrownRushInputEvent = 'crown-rush:input' as const;
+/** Server broadcasts authoritative snapshots (~12 Hz). */
+export const CrownRushStateEvent = 'crown-rush:state' as const;
+/** Server starts a Crown Rush match for both players. */
+export const CrownRushStartedEvent = 'crown-rush:started' as const;
+
+export type CrownRushStatus = 'countdown' | 'playing' | 'suddenDeath' | 'finished';
+
+export interface CrownRushInputPayload {
+  matchId: string;
+  /** -1..1 (clamped + normalized server-side). */
+  xAxis: number;
+  /** -1..1 (clamped + normalized server-side). */
+  yAxis: number;
+  /** Client sequence number (for debugging; not trusted). */
+  sequence: number;
+}
+
+export interface CrownRushPlayerState {
+  playerId: string;
+  displayName: string;
+  x: number;
+  y: number;
+  score: number;
+}
+
+export interface CrownRushStatePayload {
+  matchId: string;
+  /** Server timestamp (ms) when the snapshot was taken. */
+  serverTime: number;
+  status: CrownRushStatus;
+  /** Ms left on the match clock (0 during sudden death). */
+  timeRemainingMs: number;
+  suddenDeath: boolean;
+  players: CrownRushPlayerState[];
+  crown: { x: number; y: number; golden: boolean } | null;
+  /** Most recent capture (clients show a toast when captureSeq changes). */
+  lastCapture: { playerId: string; displayName: string; captureSeq: number } | null;
+}
+
+export interface CrownRushStartedPayload {
+  matchId: string;
+  gameType: GameType;
+  /** Server-authoritative: direct challenges are always casual. */
+  matchMode: MatchMode;
+  matchSource: MatchSource;
+  players: [MatchPlayerInfo, MatchPlayerInfo];
+  /** District each player represents, aligned with the players array order. */
+  districts: [KeralaDistrict, KeralaDistrict];
+  /** Ranked matches: the competition week (by server match-start time). */
+  competitionWeekId?: string;
+  /** Server timestamp (ms) when movement begins (3-2-1-GO). */
+  startsAt: number;
+  /** Server timestamp (ms) when this message was sent (for clock offset). */
+  serverNow: number;
+}
+
+// ---------------------------------------------------------------------------
+// Weekly battle queue (ranked cross-district matchmaking)
+// ---------------------------------------------------------------------------
+
+/** Client asks to join the weekly ranked battle queue. No game choice: the server decides. */
+export const RankedQueueJoinEvent = 'ranked-queue:join' as const;
+/** Client leaves the weekly ranked battle queue. */
+export const RankedQueueCancelEvent = 'ranked-queue:cancel' as const;
+/** Server reports queue state changes (searching / cancelled / week changed). */
+export const RankedQueueStatusEvent = 'ranked-queue:status' as const;
+/** Server tells a player a cross-district opponent was found. */
+export const RankedQueueMatchedEvent = 'ranked-queue:matched' as const;
+/** Server tells a player their queue request was rejected. */
+export const RankedQueueErrorEvent = 'ranked-queue:error' as const;
+
+/** Payload for {@link RankedQueueJoinEvent}. Intentionally empty: every
+ * matchmaking input (game, week, district, identity) is server-controlled. */
+export type RankedQueueJoinPayload = Record<string, never>;
+
+/** Payload for {@link RankedQueueCancelEvent}. */
+export type RankedQueueCancelPayload = Record<string, never>;
+
+export type RankedQueueStatusKind = 'searching' | 'cancelled' | 'week-changed';
+
+export interface RankedQueueStatusPayload {
+  status: RankedQueueStatusKind;
+  /** Unix ms when the player entered the queue (searching only). */
+  joinedAt?: number;
+  /** This week's featured game (searching only). */
+  featuredGameType?: GameType;
+  /** This week's competition ID (searching only). */
+  competitionWeekId?: string;
+  /** Live number of players currently searching (never fabricated). */
+  queueSize?: number;
+}
+
+export interface RankedQueueOpponentSummary {
+  playerId: string;
+  displayName: string;
+  district: KeralaDistrict;
+}
+
+export interface RankedQueueMatchedPayload {
+  /** Client-side correlation id for the pending ranked match. */
+  matchId: string;
+  gameType: GameType;
+  competitionWeekId: string;
+  myDistrict: KeralaDistrict;
+  opponent: RankedQueueOpponentSummary;
+}
+
+export type RankedQueueErrorReason =
+  | 'already-queued'
+  | 'in-match'
+  | 'challenge-pending'
+  | 'not-registered'
+  | 'week-unavailable';
+
+export interface RankedQueueErrorPayload {
+  reason: RankedQueueErrorReason;
+}
+
+// ---------------------------------------------------------------------------
+// Current competition (week + featured game)
+// ---------------------------------------------------------------------------
+
+export interface FeaturedGameInfo {
+  gameType: GameType;
+  label: string;
+}
+
+export interface CurrentCompetitionPayload {
+  week: CompetitionWeekInfo;
+  featuredGame: FeaturedGameInfo;
+  /** Most recently finalized week before the current one; null when none. */
+  previousChampion: PreviousChampionInfo | null;
+}
+
+// ---------------------------------------------------------------------------
+// District voice chat (LiveKit proximity voice, lobby only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Proximity voice tuning, defined once and shared. Distances are in the same
+ * world units as the Task 3 lobby (1000 x 700). The fade curve is linear:
+ * full volume at or below FULL_VOLUME_DISTANCE, silence at or above
+ * MAX_HEARING_DISTANCE, linear interpolation between.
+ */
+export const VOICE_FULL_VOLUME_DISTANCE = 120;
+export const VOICE_MAX_HEARING_DISTANCE = 320;
+
+/** How often (ms) remote participant volumes are recomputed from positions. */
+export const VOICE_VOLUME_UPDATE_INTERVAL_MS = 125;
+
+/**
+ * Lerp factor applied per volume update when fading toward the target volume.
+ * Keeps transitions smooth instead of snapping 1 -> 0.
+ */
+export const VOICE_VOLUME_SMOOTHING = 0.35;
+
+/** Minimum applied-volume delta before LiveKit's setVolume is called again. */
+export const VOICE_VOLUME_APPLY_THRESHOLD = 0.02;
+
+/**
+ * Client asks the server for a LiveKit token for their CURRENT district.
+ * Identity comes from the socket itself, so the payload is intentionally
+ * empty: the client cannot request another district's room.
+ */
+export const VoiceTokenEvent = 'voice:token' as const;
+
+/** Payload for {@link VoiceTokenEvent}. Intentionally empty. */
+export type VoiceTokenRequestPayload = Record<string, never>;
+
+export type VoiceTokenErrorReason = 'not-registered' | 'voice-disabled';
+
+export type VoiceTokenResponse =
+  | { ok: true; token: string; url: string; roomName: string }
+  | { ok: false; error: VoiceTokenErrorReason };
+
+/** Participant metadata the server embeds in each voice token (no secrets). */
+export interface VoiceParticipantMetadata {
+  playerId: string;
+  displayName: string;
+  district: KeralaDistrict;
+}
+
+/** Local voice connection lifecycle state shown in the lobby UI. */
+export type VoiceConnectionStatus = 'idle' | 'joining' | 'connected' | 'error';
+
+/**
+ * Why the local player last left voice. Drives the rejoin hint shown in the
+ * lobby ("Voice disconnected because you changed district.", etc.).
+ */
+export type VoiceLeaveReason = 'user' | 'match' | 'district-change' | 'socket-disconnect';
+
+// ---------------------------------------------------------------------------
 // Typed Socket.IO event maps (no `any`)
 // ---------------------------------------------------------------------------
 
@@ -347,6 +859,13 @@ export interface ClientToServerEvents {
   [GameRematchEvent]: (payload: GameRematchPayload) => void;
   [GameRematchCancelEvent]: (payload: GameRematchCancelPayload) => void;
   [GameReturnLobbyEvent]: (payload: GameReturnLobbyPayload) => void;
+  [CrownRushInputEvent]: (payload: CrownRushInputPayload) => void;
+  [RankedQueueJoinEvent]: (payload: RankedQueueJoinPayload) => void;
+  [RankedQueueCancelEvent]: (payload: RankedQueueCancelPayload) => void;
+  [VoiceTokenEvent]: (
+    payload: VoiceTokenRequestPayload,
+    callback: (response: VoiceTokenResponse) => void,
+  ) => void;
 }
 
 /** Events the server may emit. */
@@ -367,4 +886,11 @@ export interface ServerToClientEvents {
   [MatchOpponentDisconnectedEvent]: (payload: MatchOpponentDisconnectedPayload) => void;
   [RematchWaitingEvent]: (payload: RematchWaitingPayload) => void;
   [RematchCancelledEvent]: (payload: RematchCancelledPayload) => void;
+  [CompetitionUpdatedEvent]: (payload: CompetitionUpdatedPayload) => void;
+  [CompetitionWeekFinalizedEvent]: (payload: WeekFinalizedPayload) => void;
+  [CrownRushStartedEvent]: (payload: CrownRushStartedPayload) => void;
+  [CrownRushStateEvent]: (payload: CrownRushStatePayload) => void;
+  [RankedQueueStatusEvent]: (payload: RankedQueueStatusPayload) => void;
+  [RankedQueueMatchedEvent]: (payload: RankedQueueMatchedPayload) => void;
+  [RankedQueueErrorEvent]: (payload: RankedQueueErrorPayload) => void;
 }
