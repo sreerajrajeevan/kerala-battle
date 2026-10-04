@@ -14,6 +14,17 @@ export const ClientHelloEvent = 'client:hello' as const;
 /** Event the server emits back to acknowledge the client's hello. */
 export const ServerWelcomeEvent = 'server:welcome' as const;
 
+/**
+ * Task 11: emitted to all sockets when the server begins graceful shutdown.
+ * Clients should show a "restarting" notice; Socket.IO reconnects on its own.
+ */
+export const ServerShutdownEvent = 'server:shutdown' as const;
+
+/** Payload the server sends with {@link ServerShutdownEvent}. */
+export interface ServerShutdownPayload {
+  message: string;
+}
+
 /** Payload the client sends with {@link ClientHelloEvent}. */
 export interface ClientHelloPayload {
   /** Unix timestamp (ms) when the client sent the hello. */
@@ -765,6 +776,7 @@ export type RankedQueueErrorReason =
   | 'in-match'
   | 'challenge-pending'
   | 'not-registered'
+  | 'unavailable'
   | 'week-unavailable';
 
 export interface RankedQueueErrorPayload {
@@ -1025,4 +1037,5 @@ export interface ServerToClientEvents {
   [RankedQueueMatchedEvent]: (payload: RankedQueueMatchedPayload) => void;
   [RankedQueueErrorEvent]: (payload: RankedQueueErrorPayload) => void;
   [AuthRequiredEvent]: () => void;
+  [ServerShutdownEvent]: (payload: ServerShutdownPayload) => void;
 }
