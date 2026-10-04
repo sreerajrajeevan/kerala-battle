@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { Server, type Socket } from 'socket.io';
 import {
+  AuthRequiredEvent,
   CHALLENGE_EXPIRY_MS,
   ChallengeAcceptEvent,
   ChallengeCancelledEvent,
@@ -111,11 +112,47 @@ import {
 } from './matchmaking/rankedMatchmaker.js';
 import { CrownRushRunner, type CrownRushFinishResult } from './games/crown-rush/runner.js';
 import { createVoiceToken, loadVoiceConfig } from './voice/token.js';
+import { loadAuthConfig, warnIfAuthDisabledInProduction } from './auth/config.js';
+import { FakeIdTokenVerifier, GoogleIdTokenVerifier, type IdTokenVerifier } from './auth/google.js';
+import { buildAuthRouter } from './auth/routes.js';
+import { type SessionDeps } from './auth/sessions.js';
+import {
+  authenticateSocketHandshake,
+  gateSocketAccount,
+  setSocketAuth,
+} from './auth/socketAuth.js';
+import { setUserDistrict, type GuestClaim } from './auth/users.js';
+import { buildSafetyRouter } from './moderation/routes.js';
+import { isBlockedEitherWay } from './moderation/blocks.js';
+import { RateLimiter, RATE_LIMIT_RULES, type RateLimitRule } from './rate-limit/limiter.js';
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3001;
 const WEB_URL = process.env.WEB_URL || 'http://localhost:5173';
+
+// ---------------------------------------------------------------------------
+// Task 10: authentication + safety configuration
+// ---------------------------------------------------------------------------
+
+const authConfig = loadAuthConfig();
+warnIfAuthDisabledInProduction(authConfig);
+const sessionDeps: SessionDeps = {
+  pepper: authConfig.sessionCookieSecret,
+  // Localhost dev runs over plain http; production must use https cookies.
+  secureCookies: authConfig.isProduction,
+};
+/** Shared abuse-protection limiter (auth, voice, reports, challenges, queue). */
+const abuseLimiter = new RateLimiter();
+const googleVerifier: IdTokenVerifier = authConfig.googleClientId
+  ? new GoogleIdTokenVerifier(authConfig.googleClientId)
+  : new FakeIdTokenVerifier();
+// Credentialed web origins (Socket.IO + fetch with cookies). Comma-separated
+// WEB_URLS overrides the single WEB_URL.
+const allowedOrigins = (process.env.WEB_URLS || WEB_URL)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
 
 // LiveKit voice config. Null when credentials are absent: voice is then
 // disabled and every other feature keeps working normally.
@@ -205,6 +242,19 @@ function findPlayerById(playerId: string): ConnectedPlayer | undefined {
   return undefined;
 }
 
+/**
+ * Task 10: socket-event abuse guard. Over-limit events are dropped (with a
+ * log line) instead of disconnecting the user. Hot game loops (movement,
+ * match input) never go through this.
+ */
+function socketRateLimitOk(key: string, rule: RateLimitRule): boolean {
+  const result = abuseLimiter.check(key, rule);
+  if (!result.ok) {
+    console.warn(`[ratelimit] dropping event for ${key}`);
+  }
+  return result.ok;
+}
+
 /** Full player snapshot for a district room. Never exposes socket IDs. */
 function districtSnapshot(district: KeralaDistrict): DistrictPlayersPayload {
   const players: LobbyPlayer[] = [];
@@ -223,7 +273,8 @@ function districtSnapshot(district: KeralaDistrict): DistrictPlayersPayload {
 }
 
 const app = express();
-app.use(cors({ origin: WEB_URL }));
+// Credentials (session cookie) require explicit origins: never `*`.
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
@@ -344,12 +395,40 @@ app.get('/api/voice/status', (_req, res) => {
 
 const httpServer = createServer(app);
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
-  cors: { origin: WEB_URL },
+  cors: { origin: allowedOrigins, credentials: true },
 });
 
 // Persistent competition database (SQLite). Migrations run on startup;
 // existing data is never deleted.
 const db = getDatabase();
+
+// ---------------------------------------------------------------------------
+// Task 10: auth + safety routes
+// ---------------------------------------------------------------------------
+
+app.use(
+  '/api/auth',
+  buildAuthRouter({
+    db,
+    config: authConfig,
+    verifier: googleVerifier,
+    limiter: abuseLimiter,
+    sessionDeps,
+    allowedOrigins,
+    // The claimable guest identity comes ONLY from the server-known socket
+    // registration: the login body carries no playerId to forge.
+    getGuestForSocket: (socketId: string): GuestClaim | null => {
+      const player = connectedPlayers.get(socketId);
+      return player
+        ? { playerId: player.playerId, displayName: player.displayName, district: player.district }
+        : null;
+    },
+  }),
+);
+app.use(
+  '/api',
+  buildSafetyRouter({ db, limiter: abuseLimiter, pepper: sessionDeps.pepper, allowedOrigins }),
+);
 
 // ---------------------------------------------------------------------------
 // Weekly ranked battle queue (cross-district matchmaking)
@@ -928,6 +1007,13 @@ function participantOf(match: ActiveMatch, socketId: string): MatchParticipant |
 
 io.on('connection', (socket) => {
   console.log(`[socket] connected: ${socket.id}`);
+  // Task 10: resolve the handshake session cookie to the canonical account
+  // identity once per connection. Login/logout force a client reconnect, so
+  // this is always fresh.
+  setSocketAuth(
+    socket,
+    authenticateSocketHandshake(db, socket.handshake.headers.cookie, sessionDeps.pepper),
+  );
 
   socket.on(ClientHelloEvent, (payload: ClientHelloPayload) => {
     console.log(`[socket] ${ClientHelloEvent} from ${socket.id}`, payload);
@@ -936,15 +1022,54 @@ io.on('connection', (socket) => {
   });
 
   socket.on(PlayerJoinDistrictEvent, (payload) => {
-    if (!isValidJoinPayload(payload)) {
-      console.warn(`[socket] invalid ${PlayerJoinDistrictEvent} from ${socket.id}`);
+    // Task 10: with AUTH_REQUIRED=true the session decides the canonical
+    // identity. Client-sent playerId/displayName are ignored entirely, so a
+    // logged-in browser can never impersonate another playerId during join.
+    const gate = gateSocketAccount(db, socket, authConfig.authRequired);
+    if (!gate.ok) {
+      socket.emit(AuthRequiredEvent);
+      console.warn(`[auth] rejected ${PlayerJoinDistrictEvent} from ${socket.id}: ${gate.reason}`);
       return;
+    }
+    let playerId: string;
+    let displayName: string;
+    let district: KeralaDistrict;
+    if (gate.user) {
+      const rawDistrict =
+        typeof payload === 'object' && payload !== null
+          ? (payload as { district?: unknown }).district
+          : undefined;
+      if (!isKeralaDistrict(rawDistrict)) {
+        console.warn(`[socket] invalid ${PlayerJoinDistrictEvent} from ${socket.id}`);
+        return;
+      }
+      playerId = gate.user.playerId;
+      displayName = gate.user.displayName;
+      district = rawDistrict;
+      if (displayName === '') {
+        // New Google account that hasn't completed onboarding (name +
+        // district): the client gates this, but the server enforces it too.
+        console.warn(`[auth] rejected ${PlayerJoinDistrictEvent}: profile incomplete`);
+        return;
+      }
+      // The district choice is still the player's; persist it on the profile.
+      if (district !== gate.user.district) {
+        setUserDistrict(db, gate.user.id, district);
+      }
+    } else {
+      if (!isValidJoinPayload(payload)) {
+        console.warn(`[socket] invalid ${PlayerJoinDistrictEvent} from ${socket.id}`);
+        return;
+      }
+      playerId = payload.playerId;
+      displayName = payload.displayName.trim();
+      district = payload.district;
     }
     const previous = connectedPlayers.get(socket.id);
     // A queued or in-match player cannot switch district mid-flow: cancel the
     // queue first, or finish/leave the match. The client disables the button,
     // but the server enforces it too.
-    if (previous && previous.district !== payload.district) {
+    if (previous && previous.district !== district) {
       if (rankedMatchmaker.isQueued(socket.id)) {
         rankedMatchmaker.cancel(socket.id);
       }
@@ -958,20 +1083,18 @@ io.on('connection', (socket) => {
     // A brand-new socket (or a district switch) gets a fresh spawn point.
     // A same-socket re-join of the same district keeps its position.
     const spawn =
-      previous && previous.district === payload.district
-        ? { x: previous.x, y: previous.y }
-        : randomSpawn();
+      previous && previous.district === district ? { x: previous.x, y: previous.y } : randomSpawn();
     const next: ConnectedPlayer = {
       socketId: socket.id,
-      playerId: payload.playerId,
-      displayName: payload.displayName.trim(),
-      district: payload.district,
+      playerId,
+      displayName,
+      district,
       x: spawn.x,
       y: spawn.y,
       inMatch: previous?.inMatch ?? false,
     };
     connectedPlayers.set(socket.id, next);
-    // Persist the guest identity; a district switch updates the same row.
+    // Persist the identity; a district switch updates the same row.
     try {
       upsertPlayer(db, next.playerId, next.displayName, next.district, Date.now());
     } catch (error) {
@@ -1018,10 +1141,25 @@ io.on('connection', (socket) => {
     };
     if (!challenger || typeof targetPlayerId !== 'string') return;
     if (!isGameType(gameType)) return fail('invalid-game');
+    // Task 10: banned/suspended accounts cannot challenge; logged-out sockets
+    // are rejected when auth is required.
+    if (!gateSocketAccount(db, socket, authConfig.authRequired).ok) {
+      socket.emit(AuthRequiredEvent);
+      return;
+    }
+    if (!socketRateLimitOk(`challenge:${challenger.playerId}`, RATE_LIMIT_RULES.challengeSend)) {
+      return fail('challenge-unavailable');
+    }
     const target = findPlayerById(targetPlayerId);
     if (!target) return fail('target-not-found');
     if (target.playerId === challenger.playerId) return fail('self-challenge');
     if (target.district !== challenger.district) return fail('different-district');
+    // Task 10: a block in EITHER direction makes direct challenges
+    // unavailable. The reason is generic so neither party learns who blocked
+    // whom. Ranked queue matching is intentionally unaffected.
+    if (isBlockedEitherWay(db, challenger.playerId, target.playerId)) {
+      return fail('challenge-unavailable');
+    }
     if (busyByPlayerId.has(challenger.playerId) || busyByPlayerId.has(target.playerId)) {
       return fail('busy');
     }
@@ -1128,6 +1266,16 @@ io.on('connection', (socket) => {
   // ------------------------- weekly ranked queue -------------------------
 
   socket.on(RankedQueueJoinEvent, () => {
+    // Task 10: banned/suspended accounts cannot queue; logged-out sockets are
+    // rejected when auth is required. Status is read fresh from the DB so a
+    // mid-session ban takes effect immediately.
+    if (!gateSocketAccount(db, socket, authConfig.authRequired).ok) {
+      socket.emit(AuthRequiredEvent);
+      return;
+    }
+    const player = connectedPlayers.get(socket.id);
+    const key = player ? `queue:${player.playerId}` : `queue-socket:${socket.id}`;
+    if (!socketRateLimitOk(key, RATE_LIMIT_RULES.rankedQueueJoin)) return;
     // The payload carries nothing: game, week, district and identity are
     // all server-decided inside the matchmaker.
     rankedMatchmaker.join(socket.id);
@@ -1146,6 +1294,19 @@ io.on('connection', (socket) => {
     const player = connectedPlayers.get(socket.id);
     if (!player) {
       const response: VoiceTokenResponse = { ok: false, error: 'not-registered' };
+      callback(response);
+      return;
+    }
+    // Task 10: banned/suspended accounts cannot get voice tokens, and token
+    // requests are rate-limited per player. The canonical identity comes
+    // from the handshake session when auth is required.
+    if (!gateSocketAccount(db, socket, authConfig.authRequired).ok) {
+      const response: VoiceTokenResponse = { ok: false, error: 'not-registered' };
+      callback(response);
+      return;
+    }
+    if (!socketRateLimitOk(`voice:${player.playerId}`, RATE_LIMIT_RULES.voiceToken)) {
+      const response: VoiceTokenResponse = { ok: false, error: 'rate-limited' };
       callback(response);
       return;
     }
