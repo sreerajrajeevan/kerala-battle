@@ -14,6 +14,7 @@ import {
   RankedQueueJoinEvent,
   RankedQueueMatchedEvent,
   RankedQueueStatusEvent,
+  ServerShutdownEvent,
   ServerWelcomeEvent,
   type AuthPlayerInfo,
   type ClientHelloPayload,
@@ -35,6 +36,7 @@ import MatchView, { type ActiveMatchInfo } from './components/MatchView';
 import CrownRushView, { type CrownRushMatchInfo } from './components/CrownRushView';
 import { QueueOverlay } from './components/WeeklyBattle';
 import Onboarding from './components/Onboarding';
+import { MaintenanceOverlay, RestartToast } from './components/MaintenanceOverlay';
 import { AuthProvider } from './auth/AuthProvider';
 import { useAuth } from './auth/authContext';
 import SignInScreen from './auth/SignInScreen';
@@ -43,7 +45,9 @@ import { clearProfile, loadProfile, saveProfile } from './lib/profile';
 import type { VoiceController } from './voice/voiceContext';
 import './App.css';
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'http://localhost:3001';
+const SERVER_URL =
+  import.meta.env.VITE_SERVER_URL ??
+  (import.meta.env.DEV ? 'http://localhost:3001' : window.location.origin);
 const IS_DEV = import.meta.env.DEV;
 
 type DistrictSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -80,6 +84,11 @@ function AppShell() {
   const auth = useAuth();
   const [profile, setProfile] = useState<PlayerProfile | null>(() => loadProfile());
   const [connected, setConnected] = useState(false);
+  // Task 11: maintenance / restart notices. Maintenance comes from
+  // GET /api/version and from socket connect rejections; the shutdown notice
+  // is transient — Socket.IO reconnects on its own.
+  const [maintenanceMode, setMaintenanceMode] = useState(false);
+  const [serverRestarting, setServerRestarting] = useState(false);
   const [socketId, setSocketId] = useState<string | null>(null);
   const [populations, setPopulations] = useState<Partial<Record<KeralaDistrict, number>>>({});
   const [changingDistrict, setChangingDistrict] = useState(false);
@@ -266,9 +275,23 @@ function AppShell() {
       }, 12000);
     };
 
+    const handleShutdown = () => {
+      // Graceful server restart: show a notice; Socket.IO reconnects itself.
+      setServerRestarting(true);
+      window.setTimeout(() => setServerRestarting(false), 15000);
+    };
+
+    const handleConnectError = (error: Error) => {
+      if (error && error.message === 'maintenance') {
+        setMaintenanceMode(true);
+      }
+    };
+
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
+    socket.on('connect_error', handleConnectError);
     socket.on(ServerWelcomeEvent, handleWelcome);
+    socket.on(ServerShutdownEvent, handleShutdown);
     socket.on(AuthRequiredEvent, handleAuthRequired);
     socket.on(DistrictPopulationEvent, handlePopulation);
     socket.on(MatchStartedEvent, handleMatchStarted);
@@ -279,7 +302,9 @@ function AppShell() {
     return () => {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
+      socket.off('connect_error', handleConnectError);
       socket.off(ServerWelcomeEvent, handleWelcome);
+      socket.off(ServerShutdownEvent, handleShutdown);
       socket.off(AuthRequiredEvent, handleAuthRequired);
       socket.off(DistrictPopulationEvent, handlePopulation);
       socket.off(MatchStartedEvent, handleMatchStarted);
@@ -376,6 +401,28 @@ function AppShell() {
     return () => window.clearTimeout(id);
   }, [authNotice]);
 
+  // Task 11: maintenance flag from the server. Poll lightly so the notice
+  // clears itself when maintenance ends.
+  useEffect(() => {
+    let cancelled = false;
+    const check = async (): Promise<void> => {
+      try {
+        const res = await fetch(`${SERVER_URL}/api/version`);
+        if (!res.ok) return;
+        const data = (await res.json()) as { maintenance?: boolean };
+        if (!cancelled) setMaintenanceMode(data.maintenance === true);
+      } catch {
+        // Server unreachable: the reconnect UI covers this case.
+      }
+    };
+    void check();
+    const id = window.setInterval(() => void check(), 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
   const handleJoinWeeklyBattle = (): void => {
     setCompetitionOpen(false);
     setQueueNotice(null);
@@ -407,12 +454,15 @@ function AppShell() {
 
   if (auth.authRequired && auth.status === 'anonymous') {
     return (
-      <SignInScreen
-        googleConfigured={auth.googleConfigured}
-        googleClientId={auth.googleClientId}
-        authRequired={auth.authRequired}
-        onSignIn={handleSignIn}
-      />
+      <>
+        {maintenanceMode && <MaintenanceOverlay />}
+        <SignInScreen
+          googleConfigured={auth.googleConfigured}
+          googleClientId={auth.googleClientId}
+          authRequired={auth.authRequired}
+          onSignIn={handleSignIn}
+        />
+      </>
     );
   }
 
@@ -437,6 +487,8 @@ function AppShell() {
 
   return (
     <SafetyProvider serverUrl={SERVER_URL} enabled={auth.status === 'authenticated'}>
+      {maintenanceMode && <MaintenanceOverlay />}
+      {serverRestarting && !maintenanceMode && <RestartToast />}
       <Lobby
         profile={profile}
         connected={connected}

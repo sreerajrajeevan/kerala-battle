@@ -3,6 +3,9 @@ import dotenv from 'dotenv';
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Server, type Socket } from 'socket.io';
 import {
   AuthRequiredEvent,
@@ -48,12 +51,14 @@ import {
   ROUND_DURATION_MS,
   ROUND_PAUSE_MS,
   RankedQueueCancelEvent,
+  RankedQueueErrorEvent,
   RankedQueueJoinEvent,
   RematchCancelledEvent,
   RematchWaitingEvent,
   RoundResultEvent,
   RoundStartedEvent,
   RoundTapEvent,
+  ServerShutdownEvent,
   ServerWelcomeEvent,
   VoiceTokenEvent,
   isGameType,
@@ -84,7 +89,16 @@ import {
   type ServerWelcomePayload,
   type VoiceTokenResponse,
 } from '@kerala-battle/shared';
-import { getDatabase } from './competition/db.js';
+import { getDatabase, getReadiness, closeDatabase } from './competition/db.js';
+import { logger } from './logging/logger.js';
+import { loadServerConfig, ConfigError } from './config/serverConfig.js';
+import { metrics } from './metrics/metrics.js';
+import {
+  requestIdMiddleware,
+  httpMetricsMiddleware,
+  securityHeadersMiddleware,
+  maintenanceMiddleware,
+} from './http/middleware.js';
 import {
   getDistrictLeaderboard,
   getMyWeeklyStats,
@@ -128,8 +142,25 @@ import { RateLimiter, RATE_LIMIT_RULES, type RateLimitRule } from './rate-limit/
 
 dotenv.config();
 
-const PORT = Number(process.env.PORT) || 3001;
-const WEB_URL = process.env.WEB_URL || 'http://localhost:5173';
+// ---------------------------------------------------------------------------
+// Task 11: centralized server configuration. In production this fails fast
+// on critical security misconfiguration instead of insecure fallbacks.
+// ---------------------------------------------------------------------------
+
+let serverConfig;
+try {
+  serverConfig = loadServerConfig();
+} catch (error) {
+  if (error instanceof ConfigError) {
+    console.error(`[config] fatal: ${error.message}`);
+    process.exit(1);
+  }
+  throw error;
+}
+const PORT = serverConfig.port;
+// Credentialed web origins (Socket.IO + fetch with cookies): explicit list,
+// never `*`. Validated in production by loadServerConfig.
+const allowedOrigins = serverConfig.webOrigins;
 
 // ---------------------------------------------------------------------------
 // Task 10: authentication + safety configuration
@@ -147,20 +178,14 @@ const abuseLimiter = new RateLimiter();
 const googleVerifier: IdTokenVerifier = authConfig.googleClientId
   ? new GoogleIdTokenVerifier(authConfig.googleClientId)
   : new FakeIdTokenVerifier();
-// Credentialed web origins (Socket.IO + fetch with cookies). Comma-separated
-// WEB_URLS overrides the single WEB_URL.
-const allowedOrigins = (process.env.WEB_URLS || WEB_URL)
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter((origin) => origin.length > 0);
 
 // LiveKit voice config. Null when credentials are absent: voice is then
 // disabled and every other feature keeps working normally.
 const voiceConfig = loadVoiceConfig();
 if (voiceConfig) {
-  console.log(`[voice] enabled (url=${voiceConfig.url})`);
+  logger.info({ event: 'voice.enabled', url: voiceConfig.url });
 } else {
-  console.log('[voice] disabled: LIVEKIT_URL/API_KEY/API_SECRET not set');
+  logger.info({ event: 'voice.disabled', reason: 'LIVEKIT_URL/API_KEY/API_SECRET not set' });
 }
 
 /**
@@ -183,6 +208,8 @@ interface ConnectedPlayer {
  * new socket after the old one disconnects.
  */
 const connectedPlayers = new Map<string, ConnectedPlayer>();
+/** Task 11: live socket count for the sockets.connected gauge. */
+let activeSocketCount = 0;
 
 function districtRoom(district: KeralaDistrict): string {
   return `district:${district.toLowerCase()}`;
@@ -250,7 +277,7 @@ function findPlayerById(playerId: string): ConnectedPlayer | undefined {
 function socketRateLimitOk(key: string, rule: RateLimitRule): boolean {
   const result = abuseLimiter.check(key, rule);
   if (!result.ok) {
-    console.warn(`[ratelimit] dropping event for ${key}`);
+    logger.warn({ event: 'ratelimit.dropped', key });
   }
   return result.ok;
 }
@@ -276,9 +303,59 @@ const app = express();
 // Credentials (session cookie) require explicit origins: never `*`.
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
+// Task 11: request correlation IDs, HTTP metrics/timings, security headers.
+app.use(requestIdMiddleware);
+app.use(httpMetricsMiddleware);
+app.use(securityHeadersMiddleware({ contentSecurityPolicy: serverConfig.serveStatic }));
 
+/** Mutable runtime flags (maintenance mode, shutdown). */
+const runtime = {
+  maintenanceMode: serverConfig.maintenanceMode,
+  shuttingDown: false,
+};
+app.use(maintenanceMiddleware(() => runtime.maintenanceMode));
+
+// Liveness only: "is the process up?" — never exposes internals.
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
+});
+
+// Readiness: critical local dependencies only. External services (Google,
+// LiveKit) never make the app unready.
+app.get('/ready', (_req, res) => {
+  const readiness = getReadiness();
+  if (readiness.dbReady && readiness.schemaVersion > 0) {
+    res.json({ status: 'ready', schemaVersion: readiness.schemaVersion });
+  } else {
+    res.status(503).json({ status: 'not-ready' });
+  }
+});
+
+// Safe build metadata for operators and the beta client. No secrets.
+app.get('/api/version', (_req, res) => {
+  res.json({
+    version: serverConfig.appVersion,
+    gitCommit: serverConfig.gitCommit,
+    environment: serverConfig.nodeEnv,
+    maintenance: runtime.maintenanceMode,
+  });
+});
+
+// Internal metrics: JSON snapshot, bearer-token protected. Returns 404 when
+// no INTERNAL_METRICS_TOKEN is configured so it can never leak publicly.
+app.get('/internal/metrics', (req, res) => {
+  const token = serverConfig.internalMetricsToken;
+  if (!token) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const presented = req.get('authorization')?.replace(/^Bearer\s+/i, '');
+  if (presented !== token) {
+    metrics.inc('http.metrics_unauthorized');
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+  res.json(metrics.snapshot());
 });
 
 // ---------------------------------------------------------------------------
@@ -286,6 +363,7 @@ app.get('/health', (_req, res) => {
 // ---------------------------------------------------------------------------
 
 app.get('/api/leaderboards/players', (req, res) => {
+  const start = Date.now();
   try {
     const week = getCompetitionWeek(Date.now());
     const day = getCompetitionDay(Date.now());
@@ -297,23 +375,26 @@ app.get('/api/leaderboards/players', (req, res) => {
       players: getPlayerLeaderboard(db, week.id, limit),
       me: playerId ? getMyWeeklyStats(db, week.id, day.id, playerId) : null,
     };
+    metrics.observe('leaderboard.players.queryMs', Date.now() - start);
     res.json(payload);
   } catch (error) {
-    console.error('[competition] players leaderboard failed:', error);
+    logger.error({ event: 'competition.leaderboard_failed', scope: 'players' }, error);
     res.status(500).json({ error: 'leaderboard unavailable' });
   }
 });
 
 app.get('/api/leaderboards/districts', (_req, res) => {
+  const start = Date.now();
   try {
     const week = getCompetitionWeek(Date.now());
     const payload: DistrictsLeaderboardPayload = {
       week,
       districts: getDistrictLeaderboard(db, week.id),
     };
+    metrics.observe('leaderboard.districts.queryMs', Date.now() - start);
     res.json(payload);
   } catch (error) {
-    console.error('[competition] districts leaderboard failed:', error);
+    logger.error({ event: 'competition.leaderboard_failed', scope: 'districts' }, error);
     res.status(500).json({ error: 'leaderboard unavailable' });
   }
 });
@@ -343,7 +424,7 @@ app.get('/api/competition/current', (_req, res) => {
     };
     res.json(payload);
   } catch (error) {
-    console.error('[competition] current competition failed:', error);
+    logger.error({ event: 'competition.current_failed' }, error);
     res.status(500).json({ error: 'competition unavailable' });
   }
 });
@@ -361,7 +442,7 @@ app.get('/api/competition/history', (req, res) => {
     };
     res.json(payload);
   } catch (error) {
-    console.error('[competition] history failed:', error);
+    logger.error({ event: 'competition.history_failed' }, error);
     res.status(500).json({ error: 'history unavailable' });
   }
 });
@@ -380,7 +461,7 @@ app.get('/api/competition/history/:weekId', (req, res) => {
     }
     res.json(detail);
   } catch (error) {
-    console.error('[competition] history detail failed:', error);
+    logger.error({ event: 'competition.history_detail_failed' }, error);
     res.status(500).json({ error: 'history unavailable' });
   }
 });
@@ -397,6 +478,31 @@ const httpServer = createServer(app);
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
   cors: { origin: allowedOrigins, credentials: true },
 });
+
+// Task 11: during maintenance or graceful shutdown, new sockets are rejected
+// with a clear reason; existing connections finish what they are doing.
+io.use((socket, next) => {
+  if (runtime.maintenanceMode) return next(new Error('maintenance'));
+  if (runtime.shuttingDown) return next(new Error('server-shutdown'));
+  next();
+});
+
+metrics.startEventLoopSampler();
+
+/** Refresh aggregate presence gauges (connected sockets, players/district). */
+function updatePresenceGauges(): void {
+  metrics.set('sockets.connected', activeSocketCount);
+  const perDistrict = new Map<string, number>();
+  for (const player of connectedPlayers.values()) {
+    perDistrict.set(player.district, (perDistrict.get(player.district) ?? 0) + 1);
+  }
+  for (const district of KERALA_DISTRICTS) {
+    metrics.set(`players.byDistrict.${district.toLowerCase()}`, perDistrict.get(district) ?? 0);
+  }
+  metrics.set('queue.ranked.size', rankedQueue.size());
+  metrics.set('matches.active', matches.size + crownRushMatches.size);
+  metrics.set('challenges.pending', challenges.size);
+}
 
 // Persistent competition database (SQLite). Migrations run on startup;
 // existing data is never deleted.
@@ -429,6 +535,30 @@ app.use(
   '/api',
   buildSafetyRouter({ db, limiter: abuseLimiter, pepper: sessionDeps.pepper, allowedOrigins }),
 );
+
+// ---------------------------------------------------------------------------
+// Task 11: serve the production frontend from Express (single origin).
+// /api/*, /internal/*, /health, /ready and /socket.io keep working; every
+// other GET returns the SPA so client routes like /competition resolve.
+// ---------------------------------------------------------------------------
+
+{
+  const webDistDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist');
+  const shouldServe = serverConfig.serveStatic && existsSync(resolve(webDistDir, 'index.html'));
+  if (shouldServe) {
+    app.use(express.static(webDistDir, { maxAge: '1h', index: false }));
+    app.get(/^\/(?!api\/|internal\/|socket\.io\/|health$|ready$).*/, (_req, res) => {
+      res.sendFile(resolve(webDistDir, 'index.html'));
+    });
+    logger.info({ event: 'http.static_serving', webDistDir });
+  } else if (serverConfig.serveStatic) {
+    logger.warn({
+      event: 'http.static_missing',
+      webDistDir,
+      detail: 'SERVE_STATIC=true but no built frontend found; API-only mode.',
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Weekly ranked battle queue (cross-district matchmaking)
@@ -524,7 +654,7 @@ function expireChallenge(challengeId: string): void {
   if (!challenge) return;
   io.to(challenge.challengerSocketId).emit(ChallengeExpiredEvent, { challengeId });
   io.to(challenge.targetSocketId).emit(ChallengeExpiredEvent, { challengeId });
-  console.log(`[challenge] ${challengeId} expired`);
+  logger.info({ event: 'challenge.expired', challengeId });
 }
 
 // ---------------------------------------------------------------------------
@@ -633,9 +763,17 @@ function createMatch(
     serverNow,
   };
   io.to(matchRoom(matchId)).emit(MatchStartedEvent, payload);
-  console.log(
-    `[match] ${matchId} created: ${a.displayName} vs ${b.displayName} (${context.matchMode}/${context.matchSource})`,
-  );
+  metrics.inc('matches.started.total');
+  metrics.inc(`matches.started.${GAME_TYPE_PRECISION_CLASH}`);
+  updatePresenceGauges();
+  logger.info({
+    event: 'match.started',
+    matchId,
+    gameType: GAME_TYPE_PRECISION_CLASH,
+    matchMode: context.matchMode,
+    matchSource: context.matchSource,
+    playerIds: [a.playerId, b.playerId],
+  });
   match.roundTimer = setTimeout(() => startRound(matchId, 1), MATCH_COUNTDOWN_MS);
 }
 
@@ -673,9 +811,7 @@ function finishRound(matchId: string): void {
   });
   const payload: RoundResultPayload = { matchId, round: match.round, results };
   io.to(matchRoom(matchId)).emit(RoundResultEvent, payload);
-  console.log(
-    `[match] ${matchId} round ${match.round}: ${results.map((r) => `${r.displayName}=${r.score}`).join(', ')}`,
-  );
+  logger.debug({ event: 'match.round_result', matchId, round: match.round });
   match.roundTimer = setTimeout(() => {
     if (match.round >= match.totalRounds) finishMatch(matchId);
     else startRound(matchId, match.round + 1);
@@ -735,9 +871,17 @@ function finishMatch(matchId: string): void {
     // Lightweight ping; clients refetch leaderboard data themselves.
     io.emit(CompetitionUpdatedEvent, { competitionWeekId });
   }
-  console.log(
-    `[match] ${matchId} finished: ${totals.map((t) => `${t.displayName}=${t.total}`).join(', ')}`,
-  );
+  metrics.inc('matches.completed.total');
+  metrics.inc(`matches.completed.${GAME_TYPE_PRECISION_CLASH}`);
+  updatePresenceGauges();
+  logger.info({
+    event: 'match.finished',
+    matchId,
+    gameType: GAME_TYPE_PRECISION_CLASH,
+    matchMode: match.context.matchMode,
+    winnerPlayerId,
+    settled: competitionWeekId !== undefined,
+  });
 }
 
 /**
@@ -769,10 +913,11 @@ function settleRankedGame(input: {
     districts: input.context.districts,
   });
   if (!validation.ok) {
-    console.error(`[competition] refusing ranked settlement: ${validation.reason}`);
+    logger.error({ event: 'competition.settlement_refused', reason: validation.reason, matchId: input.matchId });
     return { settlement: undefined, competitionWeekId: undefined };
   }
   try {
+    const settleStart = Date.now();
     const outcome = settleRankedMatch(db, {
       matchId: input.matchId,
       gameType: input.gameType,
@@ -785,11 +930,13 @@ function settleRankedGame(input: {
       // started the match, even if it finished after a rollover.
       competitionWeekId: input.context.competitionWeekId,
     });
+    metrics.observe('competition.settlement.durationMs', Date.now() - settleStart);
+    metrics.inc('competition.settlements.total');
     // A settled ranked match may complete an ended week: attempt finalization.
     maybeFinalizeWeek(outcome.weekId);
     return { settlement: outcome.awards, competitionWeekId: outcome.weekId };
   } catch (error) {
-    console.error(`[competition] settlement failed for match ${input.matchId}:`, error);
+    logger.error({ event: 'competition.settlement_failed', matchId: input.matchId }, error);
     return { settlement: undefined, competitionWeekId: undefined };
   }
 }
@@ -875,9 +1022,17 @@ function createCrownRushMatch(
     serverNow,
   };
   io.to(runner.matchRoom).emit(CrownRushStartedEvent, payload);
-  console.log(
-    `[crownrush] ${runner.matchId} created: ${a.displayName} vs ${b.displayName} (${context.matchMode}/${context.matchSource})`,
-  );
+  metrics.inc('matches.started.total');
+  metrics.inc(`matches.started.${GAME_TYPE_CROWN_RUSH}`);
+  updatePresenceGauges();
+  logger.info({
+    event: 'match.started',
+    matchId: runner.matchId,
+    gameType: GAME_TYPE_CROWN_RUSH,
+    matchMode: context.matchMode,
+    matchSource: context.matchSource,
+    playerIds: [a.playerId, b.playerId],
+  });
   runner.beginCountdown(MATCH_COUNTDOWN_MS);
 }
 
@@ -922,9 +1077,17 @@ function finishCrownRushMatch(runner: CrownRushRunner, result: CrownRushFinishRe
   if (competitionWeekId) {
     io.emit(CompetitionUpdatedEvent, { competitionWeekId });
   }
-  console.log(
-    `[crownrush] ${runner.matchId} finished: ${a.displayName}=${result.scores[0]}, ${b.displayName}=${result.scores[1]}`,
-  );
+  metrics.inc('matches.completed.total');
+  metrics.inc(`matches.completed.${GAME_TYPE_CROWN_RUSH}`);
+  updatePresenceGauges();
+  logger.info({
+    event: 'match.finished',
+    matchId: runner.matchId,
+    gameType: GAME_TYPE_CROWN_RUSH,
+    matchMode: context.matchMode,
+    winnerPlayerId: result.winnerPlayerId,
+    settled: competitionWeekId !== undefined,
+  });
 }
 
 /** A match of either game type, resolved by matchId. */
@@ -1006,7 +1169,14 @@ function participantOf(match: ActiveMatch, socketId: string): MatchParticipant |
 // ---------------------------------------------------------------------------
 
 io.on('connection', (socket) => {
-  console.log(`[socket] connected: ${socket.id}`);
+  activeSocketCount++;
+  metrics.inc('sockets.connections.total');
+  updatePresenceGauges();
+  logger.info({
+    event: 'socket.connected',
+    socketId: socket.id,
+    ip: socket.handshake.address,
+  });
   // Task 10: resolve the handshake session cookie to the canonical account
   // identity once per connection. Login/logout force a client reconnect, so
   // this is always fresh.
@@ -1015,8 +1185,8 @@ io.on('connection', (socket) => {
     authenticateSocketHandshake(db, socket.handshake.headers.cookie, sessionDeps.pepper),
   );
 
-  socket.on(ClientHelloEvent, (payload: ClientHelloPayload) => {
-    console.log(`[socket] ${ClientHelloEvent} from ${socket.id}`, payload);
+  socket.on(ClientHelloEvent, (_payload: ClientHelloPayload) => {
+    logger.debug({ event: 'socket.hello', socketId: socket.id });
     const welcome: ServerWelcomePayload = { message: 'Connected to Kerala Battle' };
     socket.emit(ServerWelcomeEvent, welcome);
   });
@@ -1028,7 +1198,7 @@ io.on('connection', (socket) => {
     const gate = gateSocketAccount(db, socket, authConfig.authRequired);
     if (!gate.ok) {
       socket.emit(AuthRequiredEvent);
-      console.warn(`[auth] rejected ${PlayerJoinDistrictEvent} from ${socket.id}: ${gate.reason}`);
+      logger.warn({ event: 'auth.join_rejected', socketId: socket.id, reason: gate.reason });
       return;
     }
     let playerId: string;
@@ -1040,7 +1210,7 @@ io.on('connection', (socket) => {
           ? (payload as { district?: unknown }).district
           : undefined;
       if (!isKeralaDistrict(rawDistrict)) {
-        console.warn(`[socket] invalid ${PlayerJoinDistrictEvent} from ${socket.id}`);
+        logger.warn({ event: 'socket.invalid_join', socketId: socket.id });
         return;
       }
       playerId = gate.user.playerId;
@@ -1049,7 +1219,7 @@ io.on('connection', (socket) => {
       if (displayName === '') {
         // New Google account that hasn't completed onboarding (name +
         // district): the client gates this, but the server enforces it too.
-        console.warn(`[auth] rejected ${PlayerJoinDistrictEvent}: profile incomplete`);
+        logger.warn({ event: 'auth.join_rejected', socketId: socket.id, reason: 'profile-incomplete' });
         return;
       }
       // The district choice is still the player's; persist it on the profile.
@@ -1058,7 +1228,7 @@ io.on('connection', (socket) => {
       }
     } else {
       if (!isValidJoinPayload(payload)) {
-        console.warn(`[socket] invalid ${PlayerJoinDistrictEvent} from ${socket.id}`);
+        logger.warn({ event: 'socket.invalid_join', socketId: socket.id });
         return;
       }
       playerId = payload.playerId;
@@ -1074,9 +1244,7 @@ io.on('connection', (socket) => {
         rankedMatchmaker.cancel(socket.id);
       }
       if (busyByPlayerId.has(previous.playerId)) {
-        console.log(
-          `[district] ${previous.displayName} tried to switch district mid-match; ignored`,
-        );
+        logger.info({ event: 'district.switch_blocked_mid_match', playerId: previous.playerId });
         return;
       }
     }
@@ -1098,7 +1266,7 @@ io.on('connection', (socket) => {
     try {
       upsertPlayer(db, next.playerId, next.displayName, next.district, Date.now());
     } catch (error) {
-      console.error('[competition] upsertPlayer failed:', error);
+      logger.error({ event: 'competition.upsert_player_failed', playerId: next.playerId }, error);
     }
 
     if (previous && previous.district !== next.district) {
@@ -1109,9 +1277,14 @@ io.on('connection', (socket) => {
     socket.join(districtRoom(next.district));
     broadcastPopulation(next.district);
     broadcastPlayers(next.district);
-    console.log(
-      `[district] ${next.displayName} (${socket.id}) joined ${next.district} at ${spawn.x},${spawn.y}`,
-    );
+    updatePresenceGauges();
+    logger.info({
+      event: 'socket.joined_district',
+      socketId: socket.id,
+      playerId: next.playerId,
+      district: next.district,
+      guest: !gate.user,
+    });
   });
 
   socket.on(PlayerMoveEvent, (payload) => {
@@ -1141,6 +1314,8 @@ io.on('connection', (socket) => {
     };
     if (!challenger || typeof targetPlayerId !== 'string') return;
     if (!isGameType(gameType)) return fail('invalid-game');
+    // Task 11: no new challenges during maintenance or graceful shutdown.
+    if (runtime.maintenanceMode || runtime.shuttingDown) return fail('challenge-unavailable');
     // Task 10: banned/suspended accounts cannot challenge; logged-out sockets
     // are rejected when auth is required.
     if (!gateSocketAccount(db, socket, authConfig.authRequired).ok) {
@@ -1190,9 +1365,13 @@ io.on('connection', (socket) => {
       // Direct challenges are always casual; the server decides the mode.
       matchMode: MATCH_MODE_CASUAL,
     });
-    console.log(
-      `[challenge] ${challengeId}: ${challenger.displayName} -> ${target.displayName} (${gameType})`,
-    );
+    logger.info({
+      event: 'challenge.sent',
+      challengeId,
+      gameType,
+      challengerPlayerId: challenger.playerId,
+      targetPlayerId: target.playerId,
+    });
   });
 
   socket.on(ChallengeAcceptEvent, (payload) => {
@@ -1246,7 +1425,7 @@ io.on('connection', (socket) => {
     if (!challenge || challenge.targetSocketId !== socket.id) return;
     removeChallenge(challengeId as string);
     notifyChallengeCancelled(challenge, 'declined');
-    console.log(`[challenge] ${challengeId} declined`);
+    logger.info({ event: 'challenge.declined', challengeId });
   });
 
   socket.on(ChallengeWithdrawEvent, (payload) => {
@@ -1266,6 +1445,11 @@ io.on('connection', (socket) => {
   // ------------------------- weekly ranked queue -------------------------
 
   socket.on(RankedQueueJoinEvent, () => {
+    // Task 11: no new ranked queue joins during maintenance or shutdown.
+    if (runtime.maintenanceMode || runtime.shuttingDown) {
+      socket.emit(RankedQueueErrorEvent, { reason: 'unavailable' });
+      return;
+    }
     // Task 10: banned/suspended accounts cannot queue; logged-out sockets are
     // rejected when auth is required. Status is read fresh from the DB so a
     // mid-session ban takes effect immediately.
@@ -1279,6 +1463,14 @@ io.on('connection', (socket) => {
     // The payload carries nothing: game, week, district and identity are
     // all server-decided inside the matchmaker.
     rankedMatchmaker.join(socket.id);
+    const joined = connectedPlayers.get(socket.id);
+    logger.info({
+      event: 'queue.joined',
+      socketId: socket.id,
+      playerId: joined?.playerId,
+      queueSize: rankedQueue.size(),
+    });
+    updatePresenceGauges();
   });
 
   socket.on(RankedQueueCancelEvent, () => {
@@ -1325,7 +1517,8 @@ io.on('connection', (socket) => {
         callback(response);
       })
       .catch((error) => {
-        console.error('[voice] token issuance failed:', error);
+        metrics.inc('voice.tokenFailures');
+        logger.error({ event: 'voice.token_failed', playerId: player.playerId }, error);
         const response: VoiceTokenResponse = { ok: false, error: 'voice-disabled' };
         callback(response);
       });
@@ -1424,6 +1617,10 @@ io.on('connection', (socket) => {
 
   socket.on(GameReturnLobbyEvent, (payload) => {
     const player = connectedPlayers.get(socket.id);
+    // Task 11: returning during the 1.5s match-found intro must abort the
+    // pending match — otherwise the server would ghost-start a ranked match
+    // for a player whose UI already went back to the lobby.
+    rankedMatchmaker.cancel(socket.id);
     const resolved = resolveMatch(payload?.matchId);
     const participant = resolved ? resolveParticipant(resolved, socket.id) : undefined;
     if (resolved && participant) {
@@ -1498,6 +1695,7 @@ io.on('connection', (socket) => {
             : resolved.runner.status === 'finished';
         if (!isFinished) {
           // No ranked settlement for an incomplete/disconnected match.
+          metrics.inc('matches.disconnects');
           if (otherSocket) {
             const goneId =
               resolved.kind === 'precision' ? resolved.match.matchId : resolved.runner.matchId;
@@ -1507,12 +1705,12 @@ io.on('connection', (socket) => {
             const match = resolved.match;
             if (match.roundTimer) clearTimeout(match.roundTimer);
             matches.delete(match.matchId);
-            console.log(`[match] ${match.matchId} aborted: opponent disconnected`);
+            logger.info({ event: 'match.aborted', matchId: match.matchId, reason: 'opponent-disconnected' });
           } else {
             const runner = resolved.runner;
             runner.destroy();
             crownRushMatches.delete(runner.matchId);
-            console.log(`[crownrush] ${runner.matchId} aborted: opponent disconnected`);
+            logger.info({ event: 'match.aborted', matchId: runner.matchId, reason: 'opponent-disconnected' });
           }
         } else {
           const rematchWants =
@@ -1548,13 +1746,111 @@ io.on('connection', (socket) => {
       player.inMatch = false;
       broadcastPopulation(player.district);
       broadcastPlayers(player.district);
-      console.log(`[district] ${player.displayName} left ${player.district}`);
+      logger.info({
+        event: 'socket.left_district',
+        socketId: socket.id,
+        playerId: player.playerId,
+        district: player.district,
+      });
     }
-    console.log(`[socket] disconnected: ${socket.id} (${reason})`);
+    logger.info({ event: 'socket.disconnected', socketId: socket.id, reason });
+    activeSocketCount = Math.max(0, activeSocketCount - 1);
+    updatePresenceGauges();
   });
 });
 
+// ---------------------------------------------------------------------------
+// Task 11: graceful shutdown.
+// Sequence: stop new work (queue joins, challenges, matches) -> notify
+// sockets -> stop accepting HTTP -> clear game timers -> close Socket.IO ->
+// close the database -> exit. Bounded: never hangs indefinitely.
+// Shutdown match policy: incomplete matches are simply aborted; ranked
+// points are NEVER awarded for a match that did not finish (the same rule
+// as an opponent disconnect). Clients reconnect cleanly after restart.
+// ---------------------------------------------------------------------------
+
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+let shutdownStarted = false;
+
+function clearAllGameTimers(): void {
+  for (const challengeId of [...challenges.keys()]) removeChallenge(challengeId);
+  for (const match of matches.values()) {
+    if (match.roundTimer) clearTimeout(match.roundTimer);
+  }
+  matches.clear();
+  for (const runner of crownRushMatches.values()) runner.destroy();
+  crownRushMatches.clear();
+  clearInterval(finalizationSweep);
+  metrics.stopEventLoopSampler();
+}
+
+function shutdown(signal: string, exitCode: number): void {
+  if (shutdownStarted) {
+    logger.warn({ event: 'server.shutdown_duplicate', signal });
+    return;
+  }
+  shutdownStarted = true;
+  runtime.shuttingDown = true;
+  logger.info({ event: 'server.shutdown_start', signal });
+
+  // Tell browsers a restart is coming; Socket.IO reconnects on its own.
+  try {
+    io.emit(ServerShutdownEvent, {
+      message: 'Kerala Battle is restarting. Reconnecting…',
+    });
+  } catch (error) {
+    logger.error({ event: 'server.shutdown_notify_failed' }, error);
+  }
+
+  const forceExit = setTimeout(() => {
+    logger.error({ event: 'server.shutdown_timeout', timeoutMs: SHUTDOWN_TIMEOUT_MS });
+    process.exit(exitCode);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceExit.unref?.();
+
+  clearAllGameTimers();
+  // Disconnect remaining sockets: queued players are cancelled via their
+  // disconnect handlers; in-match players get the opponent-disconnected flow
+  // (no ranked settlement for incomplete matches).
+  io.close(() => {
+    httpServer.close(() => {
+      closeDatabase();
+      logger.info({ event: 'server.shutdown_complete', signal });
+      clearTimeout(forceExit);
+      process.exit(exitCode);
+    });
+  });
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+process.on('SIGINT', () => shutdown('SIGINT', 0));
+process.on('uncaughtException', (error) => {
+  // Fatal: log with full detail, then shut down instead of limping on.
+  logger.error({ event: 'server.uncaught_exception' }, error);
+  shutdown('uncaughtException', 1);
+});
+process.on('unhandledRejection', (reason) => {
+  // Not necessarily fatal, but always worth a loud log line with a request
+  // trail when available.
+  logger.error({ event: 'server.unhandled_rejection' }, reason);
+});
+
 httpServer.listen(PORT, () => {
+  const readiness = getReadiness();
+  // Startup version log: everything an operator needs, never secrets.
+  logger.info({
+    event: 'server.started',
+    appVersion: serverConfig.appVersion,
+    gitCommit: serverConfig.gitCommit,
+    nodeEnv: serverConfig.nodeEnv,
+    port: PORT,
+    authRequired: authConfig.authRequired,
+    voiceEnabled: voiceConfig !== null,
+    maintenanceMode: runtime.maintenanceMode,
+    dbPath: readiness.dbPath,
+    schemaVersion: readiness.schemaVersion,
+    webOrigins: allowedOrigins,
+  });
   console.log(`Kerala Battle server listening on http://localhost:${PORT}`);
 });
 
@@ -1564,16 +1860,17 @@ httpServer.listen(PORT, () => {
 {
   const recovered = ensurePastWeeksFinalized(db, { activeRankedMatchCountForWeek });
   if (recovered.finalized.length > 0 || recovered.delayed.length > 0) {
-    console.log(
-      `[competition] startup recovery: finalized [${recovered.finalized.join(', ')}]` +
-        (recovered.delayed.length > 0 ? ` delayed [${recovered.delayed.join(', ')}]` : ''),
-    );
+    logger.info({
+      event: 'competition.startup_recovery',
+      finalized: recovered.finalized,
+      delayed: recovered.delayed,
+    });
   }
 }
 
 // Periodic sweep (60s): catches week ends while the process stays up. Cheap:
 // it only attempts work for ended, unfinalized weeks.
-setInterval(() => {
+const finalizationSweep = setInterval(() => {
   try {
     const swept = ensurePastWeeksFinalized(db, { activeRankedMatchCountForWeek });
     for (const weekId of swept.finalized) {
@@ -1587,6 +1884,6 @@ setInterval(() => {
       });
     }
   } catch (error) {
-    console.error('[competition] periodic finalization sweep failed:', error);
+    logger.error({ event: 'competition.sweep_failed' }, error);
   }
 }, 60_000);
