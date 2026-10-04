@@ -150,4 +150,64 @@ export const MIGRATIONS: Migration[] = [
         ON competition_week_district_results (competition_week_id, final_rank)`,
     ],
   },
+  {
+    version: 4,
+    statements: [
+      // Stable accounts (Task 10). google_subject is the permanent external
+      // identity (email can change); player_id stays the competitive identity
+      // key used by every game system. google_subject is nullable so account
+      // deletion can unlink the Google identity without breaking history.
+      `CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        google_subject TEXT UNIQUE,
+        email TEXT,
+        email_verified INTEGER NOT NULL DEFAULT 0,
+        display_name TEXT NOT NULL DEFAULT '',
+        player_id TEXT NOT NULL UNIQUE,
+        district TEXT,
+        display_name_changed_at INTEGER,
+        status TEXT NOT NULL DEFAULT 'active',
+        deleted_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_login_at INTEGER
+      )`,
+      // Server-side sessions: only a peppered SHA-256 hash of the opaque
+      // token is stored. The raw token lives only in the HttpOnly cookie.
+      `CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id),
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        revoked_at INTEGER
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id)`,
+      // Persistent blocks. Directional: blocker silences/is shielded from
+      // blocked. No self-blocks; unique pair.
+      `CREATE TABLE IF NOT EXISTS player_blocks (
+        blocker_player_id TEXT NOT NULL,
+        blocked_player_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (blocker_player_id, blocked_player_id)
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON player_blocks (blocked_player_id)`,
+      // Player reports for operator review. No web dashboard yet; the
+      // moderation CLI reads these.
+      `CREATE TABLE IF NOT EXISTS player_reports (
+        id TEXT PRIMARY KEY,
+        reporter_player_id TEXT NOT NULL,
+        reported_player_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        context_type TEXT,
+        context_id TEXT,
+        created_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open'
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_reports_status ON player_reports (status, created_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_reports_reported ON player_reports (reported_player_id, created_at)`,
+    ],
+  },
 ];
