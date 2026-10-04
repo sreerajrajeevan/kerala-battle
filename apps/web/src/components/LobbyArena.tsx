@@ -224,6 +224,9 @@ export default function LobbyArena({
         return 'A challenge is already pending';
       case 'invalid-game':
         return 'Please pick a game to play';
+      case 'challenge-unavailable':
+        // Generic on purpose: never reveals who blocked whom.
+        return 'Challenge unavailable right now';
     }
   };
 

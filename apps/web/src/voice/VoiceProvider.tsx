@@ -24,6 +24,7 @@ import {
   type Point,
 } from './proximity';
 import { VoiceContext, type VoiceContextValue, type VoiceController } from './voiceContext';
+import { useSafety } from '../safety/safetyContext';
 import type { DistrictSocket } from '../App';
 
 /** Position snapshot the provider pulls from the lobby at each volume tick. */
@@ -110,6 +111,9 @@ export default function VoiceProvider({
 
   const roomRef = useRef<Room | null>(null);
   const statusRef = useRef<VoiceConnectionStatus>('idle');
+  // Persistent blocks silence audio in the volume loop. Synced via ref so the
+  // 8Hz loop never re-subscribes; blocking takes effect on the next tick.
+  const { blockedIds } = useSafety();
   const micMutedRef = useRef(false);
   const voiceEnabledRef = useRef(true);
   const locallyMutedRef = useRef<Set<string>>(new Set());
@@ -123,6 +127,10 @@ export default function VoiceProvider({
   const currentVolumesRef = useRef(new Map<string, number>());
   /** Last volume actually applied via setVolume, keyed by playerId. */
   const appliedVolumesRef = useRef(new Map<string, number>());
+  /** Persistent blocks: silenced in the 8Hz loop regardless of proximity. */
+  const blockedIdsRef = useRef<Set<string>>(new Set());
+  // Sync every render; the loop reads the ref so it never re-subscribes.
+  blockedIdsRef.current = blockedIds;
   const nearbyCountRef = useRef(0);
   const remoteMicMutedKeyRef = useRef('');
   const participantIdsKeyRef = useRef('');
@@ -211,6 +219,8 @@ export default function VoiceProvider({
           distanceVolume: volumeForDistance(distance),
           locallyMuted: locallyMutedRef.current.has(pid),
           voiceEnabled: voiceEnabledRef.current,
+          // Persistent block: always silent for the blocker, even mid-call.
+          blocked: blockedIdsRef.current.has(pid),
         });
         const track = micAudioTrackOf(participant);
         if (!track) continue;
@@ -352,7 +362,7 @@ export default function VoiceProvider({
   // Server capability check: hide voice UI when LiveKit is not configured.
   useEffect(() => {
     let cancelled = false;
-    fetch(`${serverUrl}/api/voice/status`)
+    fetch(`${serverUrl}/api/voice/status`, { credentials: 'include' })
       .then((response) => response.json())
       .then((data: unknown) => {
         if (!cancelled) setVoiceAvailable((data as { enabled?: boolean })?.enabled === true);

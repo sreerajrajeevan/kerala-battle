@@ -271,7 +271,9 @@ export type ChallengeFailedReason =
   | 'self-challenge'
   | 'busy'
   | 'already-pending'
-  | 'invalid-game';
+  | 'invalid-game'
+  /** A block exists in either direction; intentionally generic (no leak). */
+  | 'challenge-unavailable';
 
 export interface ChallengeFailedPayload {
   reason: ChallengeFailedReason;
@@ -820,7 +822,7 @@ export const VoiceTokenEvent = 'voice:token' as const;
 /** Payload for {@link VoiceTokenEvent}. Intentionally empty. */
 export type VoiceTokenRequestPayload = Record<string, never>;
 
-export type VoiceTokenErrorReason = 'not-registered' | 'voice-disabled';
+export type VoiceTokenErrorReason = 'not-registered' | 'voice-disabled' | 'rate-limited';
 
 export type VoiceTokenResponse =
   | { ok: true; token: string; url: string; roomName: string }
@@ -841,6 +843,135 @@ export type VoiceConnectionStatus = 'idle' | 'joining' | 'connected' | 'error';
  * lobby ("Voice disconnected because you changed district.", etc.).
  */
 export type VoiceLeaveReason = 'user' | 'match' | 'district-change' | 'socket-disconnect';
+
+// ---------------------------------------------------------------------------
+// Authentication (Task 10: Google sign-in, server sessions, stable playerId)
+// ---------------------------------------------------------------------------
+
+/** Server tells a socket its game registration was rejected: sign-in required. */
+export const AuthRequiredEvent = 'auth:required' as const;
+
+/** Public account identity returned by the auth API. Never includes Google
+ * subject, email, session identifiers, or moderation internals. */
+export interface AuthPlayerInfo {
+  playerId: string;
+  displayName: string;
+  /** Null until the player completes onboarding (name + district). */
+  district: KeralaDistrict | null;
+}
+
+/** Payload for GET /api/auth/me. */
+export interface AuthMePayload {
+  authenticated: boolean;
+  player: AuthPlayerInfo | null;
+  /** True when the account was created by this login. */
+  isNewAccount?: boolean;
+  /** True when name/district still need to be chosen. */
+  profileComplete?: boolean;
+}
+
+/** Payload for GET /api/auth/config. Public; contains no secrets. */
+export interface AuthConfigPayload {
+  /** Whether GOOGLE_CLIENT_ID is configured (Google button usable). */
+  googleConfigured: boolean;
+  /** The Google OAuth client id for the GIS button (public by design). */
+  googleClientId: string | null;
+  /** Whether AUTH_REQUIRED=true (guests cannot play). */
+  authRequired: boolean;
+}
+
+/** Payload the client sends with POST /api/auth/google. */
+export interface GoogleLoginRequest {
+  /** Google ID token (JWT) from Google Identity Services. */
+  idToken: string;
+  /**
+   * The client's current Socket.IO socket id. The server uses it ONLY to
+   * look up the already-registered guest identity on that socket and claim
+   * it when safe. The client can never choose the claimed playerId itself.
+   */
+  socketId?: string;
+}
+
+/** Payload the server returns from POST /api/auth/google. */
+export interface GoogleLoginResponse {
+  authenticated: boolean;
+  player: AuthPlayerInfo;
+  isNewAccount: boolean;
+  profileComplete: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Safety (Task 10: persistent blocking + player reporting)
+// ---------------------------------------------------------------------------
+
+/** Report reasons shown in the Report dialog. */
+export const REPORT_REASONS = [
+  'harassment',
+  'voice-abuse',
+  'inappropriate-name',
+  'cheating',
+  'spam',
+  'other',
+] as const;
+
+/** One of the report reasons. */
+export type ReportReason = (typeof REPORT_REASONS)[number];
+
+export function isReportReason(value: unknown): value is ReportReason {
+  return (
+    typeof value === 'string' && (REPORT_REASONS as readonly string[]).includes(value)
+  );
+}
+
+/** Human labels for the report reasons. */
+export const REPORT_REASON_LABELS: Record<ReportReason, string> = {
+  harassment: 'Harassment',
+  'voice-abuse': 'Voice abuse',
+  'inappropriate-name': 'Inappropriate name/profile',
+  cheating: 'Cheating',
+  spam: 'Spam',
+  other: 'Other',
+};
+
+/** Trusted report context kinds. Free-form client metadata is never trusted. */
+export const REPORT_CONTEXT_TYPES = [
+  'district-lobby',
+  'casual-match',
+  'ranked-match',
+  'voice',
+] as const;
+
+export type ReportContextType = (typeof REPORT_CONTEXT_TYPES)[number];
+
+export function isReportContextType(value: unknown): value is ReportContextType {
+  return (
+    typeof value === 'string' && (REPORT_CONTEXT_TYPES as readonly string[]).includes(value)
+  );
+}
+
+/** One blocked player, as returned by GET /api/blocks. */
+export interface BlockEntry {
+  playerId: string;
+  displayName: string;
+  createdAt: number;
+}
+
+/** Payload the client sends with POST /api/reports. */
+export interface CreateReportRequest {
+  reportedPlayerId: string;
+  reason: ReportReason;
+  /** Optional, max 500 chars. Treated as untrusted text. */
+  description?: string;
+  contextType?: ReportContextType;
+  /** Server-known match id for match contexts; otherwise untrusted/opaque. */
+  contextId?: string;
+}
+
+/** Payload the server returns from POST /api/reports. */
+export interface CreateReportResponse {
+  ok: boolean;
+  reportId: string;
+}
 
 // ---------------------------------------------------------------------------
 // Typed Socket.IO event maps (no `any`)
@@ -893,4 +1024,5 @@ export interface ServerToClientEvents {
   [RankedQueueStatusEvent]: (payload: RankedQueueStatusPayload) => void;
   [RankedQueueMatchedEvent]: (payload: RankedQueueMatchedPayload) => void;
   [RankedQueueErrorEvent]: (payload: RankedQueueErrorPayload) => void;
+  [AuthRequiredEvent]: () => void;
 }

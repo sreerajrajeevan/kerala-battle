@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import {
+  AuthRequiredEvent,
   ClientHelloEvent,
   CrownRushStartedEvent,
   DistrictPopulationEvent,
@@ -14,6 +15,7 @@ import {
   RankedQueueMatchedEvent,
   RankedQueueStatusEvent,
   ServerWelcomeEvent,
+  type AuthPlayerInfo,
   type ClientHelloPayload,
   type ClientToServerEvents,
   type CrownRushStartedPayload,
@@ -33,7 +35,11 @@ import MatchView, { type ActiveMatchInfo } from './components/MatchView';
 import CrownRushView, { type CrownRushMatchInfo } from './components/CrownRushView';
 import { QueueOverlay } from './components/WeeklyBattle';
 import Onboarding from './components/Onboarding';
-import { loadProfile, saveProfile } from './lib/profile';
+import { AuthProvider } from './auth/AuthProvider';
+import { useAuth } from './auth/authContext';
+import SignInScreen from './auth/SignInScreen';
+import { SafetyProvider } from './safety/SafetyProvider';
+import { clearProfile, loadProfile, saveProfile } from './lib/profile';
 import type { VoiceController } from './voice/voiceContext';
 import './App.css';
 
@@ -57,7 +63,21 @@ function joinDistrictPayload(profile: PlayerProfile): PlayerJoinDistrictPayload 
   };
 }
 
+function authProfileToGuest(player: AuthPlayerInfo): PlayerProfile | null {
+  if (!player.district) return null;
+  return { playerId: player.playerId, displayName: player.displayName, district: player.district };
+}
+
 export default function App() {
+  return (
+    <AuthProvider serverUrl={SERVER_URL}>
+      <AppShell />
+    </AuthProvider>
+  );
+}
+
+function AppShell() {
+  const auth = useAuth();
   const [profile, setProfile] = useState<PlayerProfile | null>(() => loadProfile());
   const [connected, setConnected] = useState(false);
   const [socketId, setSocketId] = useState<string | null>(null);
@@ -68,11 +88,15 @@ export default function App() {
   const [queueStatus, setQueueStatus] = useState<RankedQueueStatusPayload | null>(null);
   const [queueMatched, setQueueMatched] = useState<RankedQueueMatchedPayload | null>(null);
   const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [onboardingError, setOnboardingError] = useState<string | null>(null);
 
   const socketRef = useRef<DistrictSocket | null>(null);
   const [socket, setSocket] = useState<DistrictSocket | null>(null);
   const profileRef = useRef<PlayerProfile | null>(profile);
   profileRef.current = profile;
+  const authRef = useRef(auth);
+  authRef.current = auth;
   // Tracks the match-found presentation so a watchdog can rescue a stuck one.
   const matchedRef = useRef<string | null>(null);
   // Imperative voice handle, published by the lobby's VoiceProvider. Used to
@@ -82,8 +106,50 @@ export default function App() {
     voiceControllerRef.current?.leave(reason);
   };
 
+  const reconnectSocket = useCallback((): void => {
+    // Login/logout change the session cookie; the handshake is captured at
+    // connection time, so reconnect to pick up the new identity.
+    const s = socketRef.current;
+    if (s) {
+      s.disconnect();
+      s.connect();
+    }
+  }, []);
+
+  // Reconcile the lobby profile with the auth session: the canonical profile
+  // comes from /me, never from localStorage, once authenticated.
   useEffect(() => {
-    const socket: DistrictSocket = io(SERVER_URL);
+    if (auth.status !== 'authenticated' || !auth.player) return;
+    if (auth.profileComplete) {
+      const next = authProfileToGuest(auth.player);
+      if (!next) {
+        setProfile(null);
+        return;
+      }
+      const prev = profileRef.current;
+      const same =
+        prev !== null &&
+        prev.playerId === next.playerId &&
+        prev.displayName === next.displayName &&
+        prev.district === next.district;
+      if (!same) {
+        saveProfile(next);
+        setProfile(next);
+        const s = socketRef.current;
+        if (s && s.connected) {
+          s.emit(PlayerJoinDistrictEvent, joinDistrictPayload(next));
+        }
+      }
+    } else {
+      // New Google user: name + district still needed.
+      setProfile(null);
+    }
+  }, [auth.status, auth.player, auth.profileComplete]);
+
+  useEffect(() => {
+    // Cookies carry the session: required for the Socket.IO handshake when
+    // auth is enabled (cross-origin dev: 5173 -> 3001).
+    const socket: DistrictSocket = io(SERVER_URL, { withCredentials: true });
     socketRef.current = socket;
     // Publish via state so child components can attach listeners as soon as
     // the socket exists. (Child effects run before this parent effect, so a
@@ -109,6 +175,17 @@ export default function App() {
 
     const handleWelcome = (payload: ServerWelcomePayload) => {
       console.log(payload.message);
+    };
+
+    const handleAuthRequired = () => {
+      // The server rejected a game action: either the session lapsed (the
+      // sign-in screen takes over) or the account itself is unavailable
+      // (e.g. banned mid-session).
+      void authRef.current.refresh().then(() => {
+        if (authRef.current.status === 'authenticated') {
+          setAuthNotice('This account is unavailable.');
+        }
+      });
     };
 
     const handlePopulation = (payload: DistrictPopulationPayload) => {
@@ -192,6 +269,7 @@ export default function App() {
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
     socket.on(ServerWelcomeEvent, handleWelcome);
+    socket.on(AuthRequiredEvent, handleAuthRequired);
     socket.on(DistrictPopulationEvent, handlePopulation);
     socket.on(MatchStartedEvent, handleMatchStarted);
     socket.on(CrownRushStartedEvent, handleCrownRushStarted);
@@ -202,6 +280,7 @@ export default function App() {
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off(ServerWelcomeEvent, handleWelcome);
+      socket.off(AuthRequiredEvent, handleAuthRequired);
       socket.off(DistrictPopulationEvent, handlePopulation);
       socket.off(MatchStartedEvent, handleMatchStarted);
       socket.off(CrownRushStartedEvent, handleCrownRushStarted);
@@ -223,6 +302,50 @@ export default function App() {
     // the saved profile via profileRef.
   };
 
+  const handleSignIn = async (
+    idToken: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    // The socket id binds the guest-profile claim server-side: the claimable
+    // identity is the one this socket already registered as.
+    const result = await auth.signIn(idToken, socketRef.current?.id);
+    if (result.ok && result.player) {
+      setOnboardingError(null);
+      setAuthNotice(null);
+      const next = authProfileToGuest(result.player);
+      // Sync the ref immediately: the reconnect below may fire before the
+      // next render commits the state update.
+      profileRef.current = next;
+      if (next) saveProfile(next);
+      setProfile(next);
+      reconnectSocket();
+    }
+    return result;
+  };
+
+  const handleSignOut = useCallback((): void => {
+    clearProfile();
+    profileRef.current = null;
+    setProfile(null);
+    setAuthNotice(null);
+    setActiveGame(null);
+    setQueueStatus(null);
+    setQueueMatched(null);
+    reconnectSocket();
+  }, [reconnectSocket]);
+
+  const handleAuthOnboarded = async (guest: PlayerProfile): Promise<void> => {
+    // createProfile minted a throwaway guest playerId; only the chosen name
+    // and district are sent (initial setup, no rename cooldown).
+    const result = await auth.completeOnboarding(guest.displayName, guest.district);
+    if (!result.ok) {
+      setOnboardingError(result.error ?? 'Could not save profile.');
+      return;
+    }
+    setOnboardingError(null);
+    // The auth-profile effect picks up the completed profile, saves it
+    // locally, and joins the district.
+  };
+
   const handleSelectDistrict = (district: KeralaDistrict) => {
     const current = profileRef.current;
     if (!current) return;
@@ -231,7 +354,8 @@ export default function App() {
     // Leave district voice BEFORE switching: the mic must never broadcast
     // into the old district's room, and rejoining is an explicit tap.
     leaveVoice('district-change');
-    // playerId stays the same; only the district changes.
+    // playerId stays the same; only the district changes. The server persists
+    // the district on the account profile at join time.
     const next: PlayerProfile = { ...current, district };
     saveProfile(next);
     setProfile(next);
@@ -244,6 +368,13 @@ export default function App() {
     const id = window.setTimeout(() => setQueueNotice(null), 5000);
     return () => window.clearTimeout(id);
   }, [queueNotice]);
+
+  // Auto-dismiss the account notice after a while.
+  useEffect(() => {
+    if (!authNotice) return;
+    const id = window.setTimeout(() => setAuthNotice(null), 8000);
+    return () => window.clearTimeout(id);
+  }, [authNotice]);
 
   const handleJoinWeeklyBattle = (): void => {
     setCompetitionOpen(false);
@@ -266,12 +397,46 @@ export default function App() {
     socketRef.current?.emit(RankedQueueJoinEvent, {});
   };
 
+  if (auth.status === 'loading') {
+    return (
+      <main className="page">
+        <p className="subtitle">Loading Kerala Battle…</p>
+      </main>
+    );
+  }
+
+  if (auth.authRequired && auth.status === 'anonymous') {
+    return (
+      <SignInScreen
+        googleConfigured={auth.googleConfigured}
+        googleClientId={auth.googleClientId}
+        authRequired={auth.authRequired}
+        onSignIn={handleSignIn}
+      />
+    );
+  }
+
+  if (auth.status === 'authenticated' && !auth.profileComplete) {
+    return <Onboarding onComplete={(guest) => void handleAuthOnboarded(guest)} serverError={onboardingError} />;
+  }
+
+  if (auth.status === 'authenticated' && auth.profileComplete) {
+    // Guard the one frame where the auth effect hasn't reconciled yet.
+    if (!profile || (auth.player && profile.playerId !== auth.player.playerId)) {
+      return (
+        <main className="page">
+          <p className="subtitle">Loading your profile…</p>
+        </main>
+      );
+    }
+  }
+
   if (!profile) {
     return <Onboarding onComplete={handleOnboarded} />;
   }
 
   return (
-    <>
+    <SafetyProvider serverUrl={SERVER_URL} enabled={auth.status === 'authenticated'}>
       <Lobby
         profile={profile}
         connected={connected}
@@ -282,6 +447,7 @@ export default function App() {
         onSelectDistrict={handleSelectDistrict}
         onOpenCompetition={() => setCompetitionOpen(true)}
         onJoinWeeklyBattle={handleJoinWeeklyBattle}
+        onSignOut={handleSignOut}
         socket={socket}
         socketId={socketId}
         isDev={IS_DEV}
@@ -311,6 +477,11 @@ export default function App() {
           {queueNotice}
         </div>
       )}
+      {authNotice && (
+        <div className="toast queue-notice" role="alert">
+          {authNotice}
+        </div>
+      )}
       {activeGame && activeGame.gameType === GAME_TYPE_PRECISION_CLASH && (
         <MatchView
           key={activeGame.match.matchId}
@@ -333,6 +504,6 @@ export default function App() {
           onFindNextRanked={handleFindNextRanked}
         />
       )}
-    </>
+    </SafetyProvider>
   );
 }
