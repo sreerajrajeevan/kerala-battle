@@ -47,8 +47,10 @@ export function effectiveRemoteVolume(options: {
   distanceVolume: number;
   locallyMuted: boolean;
   voiceEnabled: boolean;
+  /** Persistent block: always silent for the blocker, regardless of proximity. */
+  blocked?: boolean;
 }): number {
-  if (options.locallyMuted || !options.voiceEnabled) return 0;
+  if (options.blocked || options.locallyMuted || !options.voiceEnabled) return 0;
   return Math.min(1, Math.max(0, options.distanceVolume));
 }
 

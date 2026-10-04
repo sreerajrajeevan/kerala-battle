@@ -3,6 +3,7 @@ import type { KeralaDistrict, PlayerProfile } from '@kerala-battle/shared';
 import DistrictGrid from './DistrictGrid';
 import LobbyArena from './LobbyArena';
 import { WeeklyBattleCta } from './WeeklyBattle';
+import AccountMenu from './AccountMenu';
 import { districtHue } from '../lib/visual';
 import { usePreviousChampion } from '../lib/competition';
 import type { DistrictSocket } from '../App';
@@ -18,6 +19,7 @@ interface LobbyProps {
   onSelectDistrict: (district: KeralaDistrict) => void;
   onOpenCompetition: () => void;
   onJoinWeeklyBattle: () => void;
+  onSignOut: () => void;
   socket: DistrictSocket | null;
   socketId: string | null;
   isDev: boolean;
@@ -36,6 +38,7 @@ export default function Lobby({
   onSelectDistrict,
   onOpenCompetition,
   onJoinWeeklyBattle,
+  onSignOut,
   socket,
   socketId,
   isDev,
@@ -100,6 +103,7 @@ export default function Lobby({
 
       <footer className="lobby-footer">
         <span className="player-line">{profile.displayName}</span>
+        <AccountMenu onSignOut={onSignOut} />
         <button type="button" className="secondary-btn" onClick={onOpenCompetition}>
           🏆 Competition
         </button>

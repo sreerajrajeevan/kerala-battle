@@ -24,7 +24,7 @@ interface MatchResultPanelProps {
 
 async function fetchDistricts(serverUrl: string): Promise<DistrictsLeaderboardPayload | null> {
   try {
-    const response = await fetch(`${serverUrl}/api/leaderboards/districts`);
+    const response = await fetch(`${serverUrl}/api/leaderboards/districts`, { credentials: 'include' });
     if (!response.ok) return null;
     return (await response.json()) as DistrictsLeaderboardPayload;
   } catch {

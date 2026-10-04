@@ -61,3 +61,8 @@ export function loadProfile(): PlayerProfile | null {
 export function saveProfile(profile: PlayerProfile): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(profile));
 }
+
+/** Remove the saved profile (used on sign-out / account deletion). */
+export function clearProfile(): void {
+  localStorage.removeItem(STORAGE_KEY);
+}

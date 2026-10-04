@@ -4,6 +4,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
+    "google-auth-library": "^11.1.0",
     "livekit-server-sdk": "^2.19.1",
     "socket.io": "^4.8.1"
   },
@@ -22,11 +23,16 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "npm run build && node --test dist/competition/*.test.js dist/games/crown-rush/*.test.js dist/matchmaking/*.test.js dist/voice/*.test.js",
+    "test": "npm run build && node --test dist/competition/*.test.js dist/games/crown-rush/*.test.js dist/matchmaking/*.test.js dist/voice/*.test.js dist/auth/*.test.js dist/moderation/*.test.js dist/rate-limit/*.test.js",
     "db:reset": "tsx src/scripts/db-reset.ts",
     "db:seed": "tsx src/scripts/db-seed.ts",
     "competition:set-featured": "tsx src/scripts/set-featured-game.ts",
-    "competition:finalize": "tsx src/scripts/finalize-week.ts"
+    "competition:finalize": "tsx src/scripts/finalize-week.ts",
+    "moderation:list-reports": "tsx src/scripts/moderation.ts list-reports",
+    "moderation:report-status": "tsx src/scripts/moderation.ts report-status",
+    "moderation:suspend": "tsx src/scripts/moderation.ts suspend",
+    "moderation:ban": "tsx src/scripts/moderation.ts ban",
+    "moderation:activate": "tsx src/scripts/moderation.ts activate"
   },
   "type": "module",
   "version": "0.1.0"

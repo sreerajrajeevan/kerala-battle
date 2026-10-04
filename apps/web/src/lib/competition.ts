@@ -22,7 +22,7 @@ export function usePreviousChampion(
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
-        const response = await fetch(`${serverUrl}/api/competition/current`);
+        const response = await fetch(`${serverUrl}/api/competition/current`, { credentials: 'include' });
         if (!response.ok) return;
         const data = (await response.json()) as CurrentCompetitionPayload;
         if (!cancelled) setPrevious(data.previousChampion);

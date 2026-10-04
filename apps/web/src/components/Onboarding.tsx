@@ -5,9 +5,11 @@ import DistrictGrid from './DistrictGrid';
 
 interface OnboardingProps {
   onComplete: (profile: PlayerProfile) => void;
+  /** Server-side failure surfaced after submit (e.g. Google onboarding save). */
+  serverError?: string | null;
 }
 
-export default function Onboarding({ onComplete }: OnboardingProps) {
+export default function Onboarding({ onComplete, serverError }: OnboardingProps) {
   const [displayName, setDisplayName] = useState('');
   const [district, setDistrict] = useState<KeralaDistrict | null>(null);
   const [submitted, setSubmitted] = useState(false);
@@ -52,6 +54,11 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
         <button type="submit" className="primary-btn">
           Enter Kerala Battle
         </button>
+        {serverError && (
+          <p className="error" role="alert">
+            {serverError}
+          </p>
+        )}
       </form>
     </main>
   );
