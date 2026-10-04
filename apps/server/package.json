@@ -13,6 +13,7 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^22.9.0",
+    "socket.io-client": "^4.8.4",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   },
@@ -32,7 +33,16 @@
     "moderation:report-status": "tsx src/scripts/moderation.ts report-status",
     "moderation:suspend": "tsx src/scripts/moderation.ts suspend",
     "moderation:ban": "tsx src/scripts/moderation.ts ban",
-    "moderation:activate": "tsx src/scripts/moderation.ts activate"
+    "moderation:activate": "tsx src/scripts/moderation.ts activate",
+    "db:backup": "tsx src/scripts/db-backup.ts",
+    "db:restore": "tsx src/scripts/db-restore.ts",
+    "load:http": "node load-tests/http-load.mjs",
+    "load:socket": "node load-tests/socket-load.mjs",
+    "load:queue": "node load-tests/queue-load.mjs",
+    "load:settle": "node --import tsx load-tests/settle-load.mjs",
+    "load:crownrush": "node --import tsx load-tests/crownrush-load.mjs",
+    "load:leak": "node load-tests/leak-load.mjs",
+    "load:latency": "node load-tests/latency-probe.mjs"
   },
   "type": "module",
   "version": "0.1.0"

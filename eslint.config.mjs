@@ -35,4 +35,11 @@ export default tseslint.config(
       globals: { ...globals.node },
     },
   },
+  {
+    // Task 11 load-test drivers: plain Node ESM scripts.
+    files: ['apps/server/load-tests/**/*.mjs'],
+    languageOptions: {
+      globals: { ...globals.node },
+    },
+  },
 );

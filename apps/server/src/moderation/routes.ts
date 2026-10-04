@@ -16,6 +16,8 @@ import { blockPlayer, getBlockList, unblockPlayer } from './blocks.js';
 import { createReport } from './reports.js';
 import { RATE_LIMIT_RULES, type RateLimiter } from '../rate-limit/limiter.js';
 import { requireSameOrigin } from '../auth/routes.js';
+import { metrics } from '../metrics/metrics.js';
+import { logger } from '../logging/logger.js';
 
 export interface ModerationRouteDeps {
   db: DatabaseSync;
@@ -121,6 +123,13 @@ export function buildSafetyRouter(deps: ModerationRouteDeps): Router {
       return;
     }
     const payload: CreateReportResponse = { ok: true, reportId: result.report.id };
+    metrics.inc('reports.submitted');
+    logger.info({
+      event: 'report.submitted',
+      reportId: result.report.id,
+      reason: result.report.reason,
+      requestId: req.requestId,
+    });
     res.status(201).json(payload);
   });
 
